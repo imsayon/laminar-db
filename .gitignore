@@ -1,0 +1,26 @@
+# Build output
+/build/
+/build-*/
+/out/
+/compile_commands.json
+*.o
+*.a
+*.so
+
+# Tool caches and reports
+/.cache/
+/.clangd/
+/Testing/
+coverage/
+*.profraw
+*.profdata
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Private local notes are stored outside the repository.
+.info/
