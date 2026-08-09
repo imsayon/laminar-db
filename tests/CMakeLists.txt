@@ -1,0 +1,10 @@
+function(laminar_add_test name source)
+  add_executable(${name} ${source})
+  target_link_libraries(${name} PRIVATE laminar::core)
+  target_include_directories(${name} PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  laminar_configure_target(${name})
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+laminar_add_test(laminar_memtable_tests test_memtable.cpp)
+laminar_add_test(laminar_primitives_tests test_primitives.cpp)
