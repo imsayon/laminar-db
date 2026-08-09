@@ -1,0 +1,88 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "gcc-debug",
+      "inherits": "base",
+      "displayName": "GCC Debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "g++",
+        "LAMINAR_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "clang-debug",
+      "inherits": "base",
+      "displayName": "Clang Debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "LAMINAR_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "LAMINAR_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "sanitizers",
+      "inherits": "gcc-debug",
+      "displayName": "GCC ASan and UBSan",
+      "cacheVariables": {
+        "LAMINAR_ENABLE_SANITIZERS": "ON"
+      }
+    },
+    {
+      "name": "clang-tidy",
+      "inherits": "clang-debug",
+      "displayName": "Clang-Tidy",
+      "cacheVariables": {
+        "CMAKE_CXX_CLANG_TIDY": "clang-tidy"
+      }
+    },
+    {
+      "name": "thread-sanitizer",
+      "inherits": "gcc-debug",
+      "displayName": "GCC ThreadSanitizer",
+      "cacheVariables": {
+        "LAMINAR_ENABLE_THREAD_SANITIZER": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "gcc-debug", "configurePreset": "gcc-debug", "jobs": 4 },
+    { "name": "clang-debug", "configurePreset": "clang-debug", "jobs": 4 },
+    { "name": "release", "configurePreset": "release", "jobs": 4 },
+    { "name": "sanitizers", "configurePreset": "sanitizers", "jobs": 4 },
+    { "name": "thread-sanitizer", "configurePreset": "thread-sanitizer", "jobs": 4 },
+    { "name": "clang-tidy", "configurePreset": "clang-tidy", "jobs": 4 }
+  ],
+  "testPresets": [
+    { "name": "gcc-debug", "configurePreset": "gcc-debug", "output": { "outputOnFailure": true } },
+    { "name": "clang-debug", "configurePreset": "clang-debug", "output": { "outputOnFailure": true } },
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
+    { "name": "sanitizers", "configurePreset": "sanitizers", "output": { "outputOnFailure": true } },
+    { "name": "thread-sanitizer", "configurePreset": "thread-sanitizer", "output": { "outputOnFailure": true } }
+  ]
+}
