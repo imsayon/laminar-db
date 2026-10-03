@@ -1,8 +1,8 @@
 # LaminarDB — Scope and Status
 
 Aligned: 2026-10-03. This is a summary, not an implementation plan or behavioral authority.
-Production code determines implemented behavior; tests supply verification evidence. Private
-knowledge, design reasoning, and phase planning remain private and are not published here.
+Production code determines implemented behavior; tests supply verification evidence. This document
+summarizes scope and status only.
 
 ## Planned target
 
@@ -24,7 +24,7 @@ No implementation phase is completed or authorized by this documentation alignme
 
 ## Superseded direction
 
-The earlier LSM/WiscKey/async/sharded direction is superseded for V1. Historical reasoning
-remains in private notes; it is not a competing active plan or a required future milestone.
+The earlier LSM/WiscKey/async/sharded direction is superseded for V1. It is not an active plan or
+a required future milestone.
 Ordered scans, snapshots, SSTables/LSM levels, background compaction, WiscKey, async I/O,
 Direct I/O, and sharding are outside V1. Further work needs explicit phase authorization.

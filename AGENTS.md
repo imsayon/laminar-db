@@ -4,10 +4,9 @@
 
 - Production code determines implemented behavior; tests provide verification evidence.
   README.md and ROADMAP.md are descriptive summaries, never behavioral or planning authorities.
-- Design, contracts, phase planning, and audit evidence stay in the private knowledge base.
-  Read the applicable private instructions and explicitly authorized phase before implementation.
-  Do not publish private notes, paths, task trackers, phase files, or audit records here.
-  If required contracts are unavailable, obtain them before guessing.
+- Keep this repository self-contained. Do not add personal notes or unrelated project material.
+  Establish implementation contracts and an authorized phase before coding; do not guess when
+  a required contract is missing.
 - Only in-memory foundations are implemented: utilities, Arena, SkipList, internal keys, and MemTable.
   Keep them as learning components; do not force them into the new KV path.
 - Persistence, recovery, batches, a mutex-protected shared DB handle, offline compaction, and the
@@ -16,9 +15,9 @@
   No phase is authorized by documentation alone.
 - The reduced target is one append-only data log and an owned-key RAM hash index, blocking Linux
   I/O, durable atomic mutation batches, one shared handle protected by one mutex, an exclusive
-  process lock, offline compaction, and a binary-safe CLI. Follow the privately prepared contracts.
+  process lock, offline compaction, and a binary-safe CLI. Follow contracts authorized for the task.
 - LSM levels/SSTables, snapshots/scans, WiscKey, async I/O, Direct I/O, sharding, and background
-  compaction are outside V1. Historical reasoning remains in the private KB, not an active plan here.
+  compaction are outside V1.
 
 ## Engineering rules
 
@@ -44,7 +43,7 @@
 ## Required workflow and validation
 
 1. Inspect Git state, relevant contracts/tests, and every affected caller; preserve unrelated work.
-2. Read the privately authorized phase/prerequisites. State persistence/concurrency invariants and
+2. Read the authorized phase and prerequisites. State persistence/concurrency invariants and
    failure behavior before implementation. Stop for material design contradictions; resolve routine choices.
 3. Add the phase's required boundary, malformed-input, model, resource-failure, crash/concurrency,
    and parser-fuzz checks. Fakes prove control flow; process-kill tests do not certify power loss.
@@ -80,8 +79,8 @@ scope, consistency, link, and diff checks; they do not prove engine gates.
 
 - Build only below build/; generated artifacts are disposable and must not be committed.
 - Preserve dirty/unrelated work. Do not reset, stash, overwrite, or force-push it.
-- Keep design/planning and historical reasoning in the private KB; do not copy it into this repo
-  or edit shared WORKFLOW.md. Never store task prompts in the KB.
+- Keep commits limited to implementation, tests, build configuration, and relevant repository docs.
+  Do not add unrelated files or task prompts.
 - Use primary sources for technical claims and date time-sensitive guidance.
 - Commits, pushes, PRs, deletion, merge, and release require task-scoped authorization. Stage only
   authorized files; a phase-scoped PR does not authorize merge, release, or the next phase.

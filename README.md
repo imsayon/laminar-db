@@ -33,9 +33,9 @@ Static analysis uses the `clang-tidy` configure/build preset. Generated output b
 ## Scope and ownership
 
 Production code is the authority for implemented behavior; tests provide verification evidence.
-Documentation only summarizes that behavior and the planned target. Private design and planning
-notes stay private and are not published in this repository. [ROADMAP.md](ROADMAP.md) summarizes
-scope/status; [AGENTS.md](AGENTS.md) guides repository work.
+These documents summarize implemented behavior and the planned target; they do not authorize
+implementation. [ROADMAP.md](ROADMAP.md) summarizes scope/status; [AGENTS.md](AGENTS.md) guides
+repository work.
 
 The target accepts RAM-bound live keys, log-scan startup, serialized operations, and offline
 maintenance requiring temporary disk space. Ordered scans, snapshots, SSTables/LSM levels,
