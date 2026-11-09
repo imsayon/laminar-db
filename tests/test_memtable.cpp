@@ -146,9 +146,11 @@ void RandomizedModelParity() {
 void ConcurrentReadersWithSingleWriter() {
   MemTable table;
   constexpr uint64_t kWrites = 4'000;
+  constexpr int kReaderCount = 4;
   std::atomic<bool> done{false};
   std::vector<std::thread> readers;
-  for (int thread = 0; thread < 4; ++thread) {
+  readers.reserve(kReaderCount);
+  for (int thread = 0; thread < kReaderCount; ++thread) {
     readers.emplace_back([&table, &done, thread] {
       std::mt19937 random(static_cast<uint32_t>(thread + 1));
       while (!done.load(std::memory_order_acquire)) {
