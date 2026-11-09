@@ -85,6 +85,15 @@ void Limits() {
                        Operation{Tag::Put, {}, at_limit.value.substr(2 * kOperationBytes)}};
   const auto max = EncodeFrame(Kind::Mutation, 1, aggregate).value();
   LAMINAR_CHECK_EQ(max.size(), kFrameHeaderBytes + kMaxPayload);
+  const std::string_view max_bytes(max);
+  const auto max_header =
+      DecodeFrameHeader(max_bytes.substr(0, kFrameHeaderBytes), Kind::Mutation).value();
+  LAMINAR_CHECK_EQ(max_header.payload_bytes, kMaxPayload);
+  const auto max_ops =
+      DecodePayload(max_header, Kind::Mutation, max_bytes.substr(kFrameHeaderBytes)).value();
+  LAMINAR_CHECK_EQ(max_ops.size(), aggregate.size());
+  LAMINAR_CHECK_EQ(max_ops[0].value, aggregate[0].value);
+  LAMINAR_CHECK_EQ(max_ops[1].value, aggregate[1].value);
   aggregate[1].value = at_limit.value.substr(2 * kOperationBytes - 1);
   LAMINAR_CHECK(Error(EncodeFrame(Kind::Mutation, 1, aggregate)).IsInvalidArgument());
 }

@@ -367,6 +367,49 @@ struct DB::Impl {
     return std::string(op.value);
   }
 
+  Status Commit(std::span<const Operation> ops) noexcept try {
+    std::lock_guard guard(mutex);
+    LAMINAR_RETURN_IF_ERROR(CheckHealthy());
+    if (ops.empty()) {
+      return Status::OK();
+    }
+    if (frontier == kMaxSequence) {
+      return Status::Full("maximum commit sequence");
+    }
+    const uint64_t sequence = frontier + 1;
+    auto bytes = EncodeFrame(Kind::Mutation, sequence, ops);
+    if (!bytes) {
+      return std::move(bytes).error();
+    }
+    if (bytes->size() > kMaxOffset - offset) {
+      return Status::Full("maximum log offset");
+    }
+
+    state = State::ReopenRequired;
+    if (auto status = log.Append(*bytes); !status.ok()) {
+      return ReopenRequired(status);
+    }
+    if (auto status = log.Sync(Point::DataSync); !status.ok()) {
+      return ReopenRequired(status);
+    }
+    try {
+      At(Point::BeforePublish, kLog);
+      for (size_t ordinal = 0; ordinal < ops.size(); ++ordinal) {
+        Apply(index, ops[ordinal], {Kind::Mutation, offset, bytes->size(), ordinal});
+        At(Point::AfterApply, kLog);
+      }
+    } catch (...) {
+      return ReopenRequired(CurrentException());
+    }
+    frontier = sequence;
+    offset += bytes->size();
+    state = State::Healthy;
+    At(Point::AfterPublish, kLog);
+    return Status::OK();
+  } catch (...) {
+    return CurrentException();
+  }
+
   std::mutex mutex;
   File lock;
   File log;
@@ -376,6 +419,28 @@ struct DB::Impl {
   uint64_t offset;
   State state{State::Healthy};
 };
+
+Status WriteBatch::Put(Slice key, Slice value) noexcept { return Add(key, value, false); }
+
+Status WriteBatch::Delete(Slice key) noexcept { return Add(key, {}, true); }
+
+Status WriteBatch::Add(Slice key, Slice value, bool erase) noexcept try {
+  if (key.size() > kMaxKey || value.size() > kMaxValue) {
+    return Status::InvalidArgument("batch key/value limit");
+  }
+  if (mutations_.size() == kMaxOperations) {
+    return Status::InvalidArgument("batch operation limit");
+  }
+  const size_t payload = mutations_.empty() ? 0 : mutations_.back().payload_end;
+  const size_t size = kOperationBytes + key.size() + value.size();
+  if (size > kMaxPayload - payload) {
+    return Status::InvalidArgument("batch payload limit");
+  }
+  mutations_.push_back({erase, key.ToString(), value.ToString(), payload + size});
+  return Status::OK();
+} catch (...) {
+  return CurrentException();
+}
 
 DB::DB(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 DB::~DB() = default;
@@ -457,46 +522,23 @@ Result<Inspection> Inspect(std::string_view directory) noexcept try {
   return std::unexpected(CurrentException());
 }
 
-Status DB::Put(Slice key, Slice value) noexcept { return Mutate(key, value, false); }
+Status DB::Put(Slice key, Slice value) noexcept {
+  const Operation op{Tag::Put, key.ToStringView(), value.ToStringView()};
+  return impl_->Commit(std::span(&op, 1));
+}
 
-Status DB::Delete(Slice key) noexcept { return Mutate(key, {}, true); }
+Status DB::Delete(Slice key) noexcept {
+  const Operation op{Tag::Delete, key.ToStringView(), {}};
+  return impl_->Commit(std::span(&op, 1));
+}
 
-Status DB::Mutate(Slice key, Slice value, bool erase) noexcept try {
-  std::lock_guard guard(impl_->mutex);
-  LAMINAR_RETURN_IF_ERROR(impl_->CheckHealthy());
-  if (impl_->frontier == kMaxSequence) {
-    return Status::Full("maximum commit sequence");
+Status DB::Write(const WriteBatch& batch) noexcept {
+  std::array<Operation, kMaxOperations> ops;
+  size_t count = 0;
+  for (const auto& mutation : batch.mutations_) {
+    ops[count++] = {mutation.erase ? Tag::Delete : Tag::Put, mutation.key, mutation.value};
   }
-  const uint64_t sequence = impl_->frontier + 1;
-  const Operation op{erase ? Tag::Delete : Tag::Put, key.ToStringView(), value.ToStringView()};
-  auto bytes = EncodeFrame(Kind::Mutation, sequence, std::span(&op, 1));
-  if (!bytes) {
-    return std::move(bytes).error();
-  }
-  if (bytes->size() > kMaxOffset - impl_->offset) {
-    return Status::Full("maximum log offset");
-  }
-
-  impl_->state = Impl::State::ReopenRequired;
-  if (auto status = impl_->log.Append(*bytes); !status.ok()) {
-    return ReopenRequired(status);
-  }
-  if (auto status = impl_->log.Sync(Point::DataSync); !status.ok()) {
-    return ReopenRequired(status);
-  }
-  try {
-    At(Point::BeforePublish, kLog);
-    Apply(impl_->index, op, {Kind::Mutation, impl_->offset, bytes->size(), 0});
-  } catch (...) {
-    return ReopenRequired(CurrentException());
-  }
-  impl_->frontier = sequence;
-  impl_->offset += bytes->size();
-  impl_->state = Impl::State::Healthy;
-  At(Point::AfterPublish, kLog);
-  return Status::OK();
-} catch (...) {
-  return CurrentException();
+  return impl_->Commit(std::span(ops).first(count));
 }
 
 Result<std::string> DB::Get(Slice key) noexcept try {

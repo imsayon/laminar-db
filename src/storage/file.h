@@ -26,6 +26,7 @@ enum class Point : uint8_t {
   Close,
   Random,
   BeforePublish,
+  AfterApply,
   AfterPublish,
 };
 
