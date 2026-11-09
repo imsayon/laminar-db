@@ -8,3 +8,23 @@ endfunction()
 
 laminar_add_test(laminar_memtable_tests test_memtable.cpp)
 laminar_add_test(laminar_primitives_tests test_primitives.cpp)
+laminar_add_test(laminar_format_tests test_format.cpp)
+laminar_add_test(laminar_db_tests test_db.cpp)
+laminar_add_test(laminar_storage_failure_tests test_storage_failures.cpp)
+add_test(NAME laminar_cli_tests
+  COMMAND ${CMAKE_COMMAND} -DCLI=$<TARGET_FILE:laminar> -P ${CMAKE_CURRENT_SOURCE_DIR}/test_cli.cmake)
+set_tests_properties(laminar_storage_failure_tests PROPERTIES TIMEOUT 180)
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT LAMINAR_ENABLE_THREAD_SANITIZER)
+  add_executable(laminar_format_fuzz EXCLUDE_FROM_ALL
+    fuzz_format.cpp
+    ${PROJECT_SOURCE_DIR}/src/storage/format.cpp
+    ${PROJECT_SOURCE_DIR}/src/util/crc32c.cpp
+    ${PROJECT_SOURCE_DIR}/src/util/status.cpp
+  )
+  target_include_directories(laminar_format_fuzz PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+  target_compile_options(laminar_format_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
+  target_link_options(laminar_format_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
+  laminar_configure_target(laminar_format_fuzz)
+endif()

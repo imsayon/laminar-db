@@ -24,6 +24,7 @@ public:
   Status() = default;
 
   [[nodiscard]] static Status OK() { return {}; }
+  [[nodiscard]] static Status FromCode(Code code) noexcept { return Status{code}; }
   [[nodiscard]] static Status NotFound(std::string_view message = {}) {
     return {Code::kNotFound, message};
   }
@@ -59,6 +60,7 @@ public:
   friend bool operator==(const Status&, const Status&) = default;
 
 private:
+  explicit Status(Code code) noexcept : code_(code) {}
   Status(Code code, std::string_view message) : code_(code), message_(message) {}
 
   Code code_{Code::kOk};

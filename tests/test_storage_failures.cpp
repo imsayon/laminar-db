@@ -1,0 +1,580 @@
+#include <array>
+#include <cerrno>
+#include <csignal>
+#include <cstdlib>
+#include <fcntl.h>
+#include <filesystem>
+#include <limits>
+#include <new>
+#include <optional>
+#include <random>
+#include <span>
+#include <string>
+#include <string_view>
+#include <sys/wait.h>
+#include <tuple>
+#include <unistd.h>
+#include <unordered_map>
+
+#include "laminar/db.h"
+#include "storage/file.h"
+#include "storage_test_support.h"
+#include "v1_fixtures.h"
+
+namespace {
+
+thread_local int allocations_before_failure = -1;
+
+} // namespace
+
+void* operator new(std::size_t size) {
+  if (allocations_before_failure == 0) {
+    allocations_before_failure = -1;
+    throw std::bad_alloc{};
+  }
+  if (allocations_before_failure > 0) {
+    --allocations_before_failure;
+  }
+  if (void* allocation = std::malloc(size == 0 ? 1 : size)) {
+    return allocation;
+  }
+  throw std::bad_alloc{};
+}
+
+[[gnu::noinline]] void operator delete(void* allocation) noexcept { std::free(allocation); }
+[[gnu::noinline]] void operator delete(void* allocation, std::size_t) noexcept {
+  std::free(allocation);
+}
+
+namespace {
+
+using namespace laminar;
+using namespace laminar::storage;
+using namespace laminar::test;
+namespace fs = std::filesystem;
+
+struct Plan {
+  Point point;
+  std::string_view target;
+  std::span<const Fault> steps{};
+  size_t skip{};
+  bool repeat{};
+  bool stop{};
+  int fail_allocation{-1};
+  size_t calls{};
+};
+
+thread_local Plan* active_plan = nullptr;
+
+Fault Inject(Point point, std::string_view target) noexcept {
+  auto& plan = *active_plan;
+  if (plan.point != point || plan.target != target) {
+    return {};
+  }
+  const size_t call = plan.calls++;
+  if (call < plan.skip) {
+    return {};
+  }
+  const size_t index = call - plan.skip;
+  if (index < plan.steps.size()) {
+    return plan.steps[index];
+  }
+  if (plan.stop) {
+    ::raise(SIGSTOP);
+  }
+  if (plan.fail_allocation >= 0) {
+    allocations_before_failure = plan.fail_allocation;
+  }
+  return plan.repeat ? plan.steps.back() : Fault{};
+}
+
+class WithFault {
+public:
+  explicit WithFault(Plan& plan) {
+    active_plan = &plan;
+    fault_hook = Inject;
+  }
+  ~WithFault() {
+    fault_hook = nullptr;
+    active_plan = nullptr;
+    allocations_before_failure = -1;
+  }
+};
+
+size_t DescriptorCount() {
+  return static_cast<size_t>(
+      std::distance(fs::directory_iterator("/proc/self/fd"), fs::directory_iterator{}));
+}
+
+void TransferAndOffsetHandling() {
+  const Scratch scratch;
+  const auto path = scratch.root / "db";
+  const auto log = path / "data.log";
+  const std::array short_io{Fault{EINTR}, Fault{0, 1}, Fault{0, 4}};
+  Plan random{Point::Random, "db_id", short_io};
+  auto db = [&] {
+    const WithFault inject(random);
+    return DB::Open(path.string()).value();
+  }();
+  LAMINAR_CHECK_EQ(random.calls, 4U);
+  const std::string key("key\0", 4);
+  {
+    Plan plan{Point::Write, "data.log", short_io};
+    const WithFault inject(plan);
+    LAMINAR_CHECK(db->Put(key, "payload").ok());
+    LAMINAR_CHECK_EQ(plan.calls, 4U);
+  }
+  {
+    Plan plan{Point::Read, "data.log", short_io};
+    const WithFault inject(plan);
+    LAMINAR_CHECK_EQ(db->Get(key).value(), "payload");
+    LAMINAR_CHECK_EQ(plan.calls, 5U);
+  }
+  LAMINAR_CHECK(db->Close().ok());
+
+  auto file = File::OpenAt(AT_FDCWD, log.c_str(), "data.log", O_RDWR | O_NOFOLLOW).value();
+  std::array<char, 4> bytes{};
+  LAMINAR_CHECK(Error(file.Read(kMaxOffset, bytes)).IsIOError());
+  LAMINAR_CHECK(Error(file.Read(kMaxOffset + 1, {})).IsIOError());
+  LAMINAR_CHECK(file.Truncate(kMaxOffset + 1).IsIOError());
+  LAMINAR_CHECK_EQ(file.Read(file.Size().value(), bytes).value(), 0U);
+  LAMINAR_CHECK((::fcntl(file.fd(), F_GETFD) & FD_CLOEXEC) != 0);
+  LAMINAR_CHECK(file.Close().ok());
+}
+
+void CreationFailures() {
+  const Scratch scratch;
+  const auto path = scratch.root / "db";
+  const auto log = path / "data.log";
+  const auto temp = path / "create.tmp";
+  const size_t descriptors = DescriptorCount();
+  const std::array io_error{Fault{EIO}};
+  for (const auto& [point, target, installed, skip] : std::array{
+           std::tuple{Point::Mkdir, "DB directory", false, 0U},
+           std::tuple{Point::Open, "LOCK", false, 0U}, std::tuple{Point::Stat, "LOCK", false, 0U},
+           std::tuple{Point::Lock, "LOCK", false, 0U},
+           std::tuple{Point::Random, "db_id", false, 0U},
+           std::tuple{Point::Open, "create.tmp", false, 1U},
+           std::tuple{Point::Write, "create.tmp", false, 0U},
+           std::tuple{Point::Sync, "create.tmp", false, 0U},
+           std::tuple{Point::Close, "create.tmp", false, 0U},
+           std::tuple{Point::Rename, "create.tmp", false, 0U},
+           std::tuple{Point::Open, "data.log", true, 1U},
+           std::tuple{Point::DataSync, "data.log", true, 0U},
+           std::tuple{Point::Sync, "DB directory", true, 0U},
+           std::tuple{Point::Sync, "parent directory", true, 0U},
+           std::tuple{Point::Close, "DB directory", true, 0U}}) {
+    fs::remove_all(path);
+    Plan plan{point, target, io_error, skip};
+    {
+      const WithFault inject(plan);
+      LAMINAR_CHECK(Error(DB::Open(path.string())).IsIOError());
+    }
+    LAMINAR_CHECK_EQ(plan.calls, skip + 1U);
+    LAMINAR_CHECK_EQ(DescriptorCount(), descriptors);
+    LAMINAR_CHECK_EQ(fs::exists(log), installed);
+    const auto existing = installed ? Read(log) : std::string{};
+    auto db = DB::Open(path.string()).value();
+    LAMINAR_CHECK(db->Close().ok());
+    LAMINAR_CHECK(!fs::exists(temp));
+    if (installed) {
+      LAMINAR_CHECK_EQ(Read(log), existing);
+    }
+  }
+
+  fs::remove(log);
+  Write(temp, "LMNRDATA");
+  Plan unlink{Point::Unlink, "create.tmp", io_error};
+  {
+    const WithFault inject(unlink);
+    LAMINAR_CHECK(Error(DB::Open(path.string())).IsIOError());
+  }
+  LAMINAR_CHECK_EQ(Read(temp), "LMNRDATA");
+  LAMINAR_CHECK(!fs::exists(log));
+  const std::array short_eof{Fault{0, 0}};
+  Plan temp_eof{Point::Read, "create.tmp", short_eof};
+  {
+    const WithFault inject(temp_eof);
+    LAMINAR_CHECK(Error(DB::Open(path.string())).IsCorruption());
+  }
+  LAMINAR_CHECK_EQ(Read(temp), "LMNRDATA");
+  LAMINAR_CHECK_EQ(DescriptorCount(), descriptors);
+}
+
+void RecoveryFailures() {
+  const Scratch scratch;
+  const auto path = scratch.root / "db";
+  const auto log = path / "data.log";
+  const size_t descriptors = DescriptorCount();
+  const auto partial = kMixed.substr(0, kMixed.size() - 1);
+  const std::array io_error{Fault{EIO}};
+  for (const auto& [point, skip] : std::array{
+           std::pair{Point::Open, 0U}, std::pair{Point::Read, 0U}, std::pair{Point::Read, 3U},
+           std::pair{Point::Truncate, 0U}, std::pair{Point::DataSync, 0U}}) {
+    InstallFixture(path, partial);
+    Plan plan{point, "data.log", io_error, skip, true};
+    {
+      const WithFault inject(plan);
+      LAMINAR_CHECK(Error(DB::Open(path.string())).IsIOError());
+      LAMINAR_CHECK(Error(DB::Open(path.string())).IsIOError());
+    }
+    LAMINAR_CHECK_EQ(DescriptorCount(), descriptors);
+    LAMINAR_CHECK_EQ(Read(log), point == Point::DataSync ? kFresh : partial);
+    auto db = DB::Open(path.string()).value();
+    LAMINAR_CHECK_EQ(Read(log), kFresh);
+    LAMINAR_CHECK(db->Close().ok());
+  }
+
+  InstallFixture(path, partial);
+  const std::array short_eof{Fault{0, 0}};
+  Plan unexpected_eof{Point::Read, "data.log", short_eof, 3};
+  {
+    const WithFault inject(unexpected_eof);
+    LAMINAR_CHECK(Error(DB::Open(path.string())).IsCorruption());
+  }
+  LAMINAR_CHECK_EQ(Read(log), partial);
+  fault_hook = [](Point point, std::string_view) noexcept -> Fault {
+    switch (point) {
+    case Point::Truncate:
+    case Point::Sync:
+    case Point::DataSync:
+    case Point::Write:
+    case Point::Mkdir:
+    case Point::Unlink:
+    case Point::Rename:
+      return {EIO};
+    default:
+      return {};
+    }
+  };
+  const auto inspected = Inspect(path.string());
+  fault_hook = nullptr;
+  LAMINAR_CHECK_EQ(inspected.value().incomplete_tail_bytes, 53U);
+  LAMINAR_CHECK_EQ(Read(log), partial);
+  LAMINAR_CHECK_EQ(DescriptorCount(), descriptors);
+}
+
+void AmbiguousWrites() {
+  const Scratch scratch;
+  const auto path = scratch.root / "db";
+  const auto log = path / "data.log";
+  const size_t descriptors = DescriptorCount();
+  const std::array no_transfer{Fault{0, 0}};
+  const std::array partial{Fault{0, 3}, Fault{ENOSPC}};
+  const std::array append_fail{Fault{EDQUOT}};
+  const std::array sync_fail{Fault{EIO}};
+  for (const auto& [point, faults, tail, committed] :
+       std::array{std::tuple{Point::Write, std::span<const Fault>(no_transfer), 0U, false},
+                  std::tuple{Point::Write, std::span<const Fault>(partial), 3U, false},
+                  std::tuple{Point::Write, std::span<const Fault>(append_fail), 0U, false},
+                  std::tuple{Point::DataSync, std::span<const Fault>(sync_fail), 0U, true}}) {
+    InstallFixture(path, kFresh);
+    auto db = DB::Open(path.string()).value();
+    LAMINAR_CHECK(db->Put("old", "kept").ok());
+    Plan plan{point, "data.log", faults};
+    {
+      const WithFault inject(plan);
+      const auto status = db->Put("candidate", "value");
+      LAMINAR_CHECK(status.IsIOError());
+      LAMINAR_CHECK(status.message().find("may already be committed") != std::string::npos);
+      LAMINAR_CHECK(db->Put("later", "blocked").IsIOError());
+      LAMINAR_CHECK(db->Delete("old").IsIOError());
+      LAMINAR_CHECK(Error(db->Get("old")).IsIOError());
+    }
+    LAMINAR_CHECK_EQ(plan.calls, faults.size());
+    LAMINAR_CHECK(db->Close().ok());
+    LAMINAR_CHECK_EQ(DescriptorCount(), descriptors);
+    const auto disk = Read(log);
+    LAMINAR_CHECK_EQ(Inspect(path.string()).value().incomplete_tail_bytes, tail);
+    LAMINAR_CHECK_EQ(Read(log), disk);
+    db = DB::Open(path.string()).value();
+    LAMINAR_CHECK_EQ(db->Get("old").value(), "kept");
+    if (committed) {
+      LAMINAR_CHECK_EQ(db->Get("candidate").value(), "value");
+    } else {
+      LAMINAR_CHECK(Error(db->Get("candidate")).IsNotFound());
+    }
+    LAMINAR_CHECK(Error(db->Get("later")).IsNotFound());
+    LAMINAR_CHECK_EQ(Read(log), disk.substr(0, disk.size() - tail));
+    LAMINAR_CHECK(db->Put("new", "").ok());
+    LAMINAR_CHECK(db->Close().ok());
+  }
+}
+
+void AllocationAndReadFailures() {
+  const Scratch scratch;
+  const auto path = scratch.root / "db";
+  const auto log = path / "data.log";
+  auto db = DB::Open(path.string()).value();
+  const std::string key(48, 'k');
+  const std::string value(512, 'v');
+  LAMINAR_CHECK(db->Put(key, value).ok());
+  const auto before = Read(log);
+
+  allocations_before_failure = 0;
+  const auto encoding = db->Put("new", value);
+  LAMINAR_CHECK(encoding.IsFull());
+  LAMINAR_CHECK_EQ(Read(log), before);
+  allocations_before_failure = 2; // Scratch and operation vector succeed. The returned copy fails.
+  const auto copy = db->Get(key);
+  LAMINAR_CHECK(Error(copy).IsFull());
+  LAMINAR_CHECK_EQ(db->Get(key).value(), value);
+
+  Plan publish{Point::BeforePublish, "data.log", {}, 0, false, false, 0};
+  {
+    const WithFault inject(publish);
+    const auto status = db->Put("new", value);
+    LAMINAR_CHECK(status.IsFull());
+    LAMINAR_CHECK(status.message().find("may already be committed") != std::string::npos);
+    LAMINAR_CHECK(Error(db->Get(key)).IsIOError());
+    LAMINAR_CHECK(db->Delete(key).IsIOError());
+  }
+  LAMINAR_CHECK(db->Close().ok());
+
+  const auto directory = path.string();
+  const size_t descriptors = DescriptorCount();
+  Plan replay{Point::Read, "data.log", {}, 3, false, false, 1};
+  {
+    const WithFault inject(replay);
+    LAMINAR_CHECK(Error(DB::Open(directory)).IsFull());
+  }
+  LAMINAR_CHECK_EQ(replay.calls, 4U);
+  LAMINAR_CHECK_EQ(DescriptorCount(), descriptors);
+  db = DB::Open(directory).value();
+  LAMINAR_CHECK_EQ(db->Get("new").value(), value);
+
+  fault_hook = [](Point point, std::string_view) noexcept -> Fault {
+    if (point == Point::Read) {
+      allocations_before_failure = 0;
+      return {EIO};
+    }
+    return {};
+  };
+  const auto read = db->Get(key);
+  fault_hook = nullptr;
+  LAMINAR_CHECK(Error(read).IsIOError());
+  LAMINAR_CHECK(Error(read).message().empty());
+  LAMINAR_CHECK(db->Put("blocked", value).IsIOError());
+  LAMINAR_CHECK(db->Close().ok());
+}
+
+void ExplicitCloseErrors() {
+  const Scratch scratch;
+  const auto path = scratch.root / "db";
+  const size_t descriptors = DescriptorCount();
+  for (const std::string_view label : {"data.log", "LOCK"}) {
+    auto db = DB::Open(path.string()).value();
+    LAMINAR_CHECK(db->Put("key", "value").ok());
+    const std::array interrupted{Fault{EINTR}};
+    Plan close{Point::Close, label, interrupted, 0, true};
+    {
+      const WithFault inject(close);
+      LAMINAR_CHECK(db->Close().IsIOError());
+      LAMINAR_CHECK(db->Close().ok());
+    }
+    LAMINAR_CHECK_EQ(close.calls, 1U);
+    LAMINAR_CHECK_EQ(DescriptorCount(), descriptors);
+    LAMINAR_CHECK(Error(db->Get("key")).IsIOError());
+    db = DB::Open(path.string()).value();
+    LAMINAR_CHECK_EQ(db->Get("key").value(), "value");
+    LAMINAR_CHECK(db->Close().ok());
+  }
+}
+
+void KillDuring(const std::string& directory, Plan plan, bool creating, std::string_view key = {},
+                std::string_view value = {}) {
+  const pid_t child = ::fork();
+  LAMINAR_CHECK(child >= 0);
+  if (child == 0) {
+    if (creating) {
+      const WithFault inject(plan);
+      (void)DB::Open(directory);
+    } else {
+      auto db = DB::Open(directory);
+      if (db) {
+        const WithFault inject(plan);
+        (void)(*db)->Put(key, value);
+      }
+    }
+    ::_exit(99);
+  }
+
+  int state = 0;
+  LAMINAR_CHECK_EQ(::waitpid(child, &state, WUNTRACED), child);
+  LAMINAR_CHECK(WIFSTOPPED(state));
+  const auto busy = DB::Open(directory);
+  const int killed = ::kill(child, SIGKILL);
+  LAMINAR_CHECK_EQ(::waitpid(child, &state, 0), child);
+  LAMINAR_CHECK_EQ(killed, 0);
+  LAMINAR_CHECK(WIFSIGNALED(state));
+  LAMINAR_CHECK_EQ(WTERMSIG(state), SIGKILL);
+  LAMINAR_CHECK(Error(busy).IsAlreadyExists());
+}
+
+void VerifyInFreshProcess(const std::string& directory, std::string_view key,
+                          std::optional<std::string_view> expected) {
+  const pid_t child = ::fork();
+  LAMINAR_CHECK(child >= 0);
+  if (child == 0) {
+    auto db = DB::Open(directory);
+    if (!db) {
+      ::_exit(1);
+    }
+    const auto got = (*db)->Get(key);
+    const bool match = expected ? got && *got == *expected : !got && got.error().IsNotFound();
+    ::_exit(match && (*db)->Close().ok() ? 0 : 2);
+  }
+  int state = 0;
+  LAMINAR_CHECK_EQ(::waitpid(child, &state, 0), child);
+  LAMINAR_CHECK(WIFEXITED(state));
+  LAMINAR_CHECK_EQ(WEXITSTATUS(state), 0);
+}
+
+void KillAtCreationBoundaries() {
+  const Scratch scratch;
+  const auto path = scratch.root / "db";
+  const auto directory = path.string();
+  const auto log = path / "data.log";
+  const std::array short_magic{Fault{0, 3}};
+  const std::array header_only{Fault{0, 64}};
+  for (const auto& [point, target, installed, steps] : std::array{
+           std::tuple{Point::Write, "create.tmp", false, std::span<const Fault>{}},
+           std::tuple{Point::Write, "create.tmp", false, std::span<const Fault>(short_magic)},
+           std::tuple{Point::Write, "create.tmp", false, std::span<const Fault>(header_only)},
+           std::tuple{Point::Sync, "create.tmp", false, std::span<const Fault>{}},
+           std::tuple{Point::Close, "create.tmp", false, std::span<const Fault>{}},
+           std::tuple{Point::Rename, "create.tmp", false, std::span<const Fault>{}},
+           std::tuple{Point::DataSync, "data.log", true, std::span<const Fault>{}},
+           std::tuple{Point::Sync, "DB directory", true, std::span<const Fault>{}},
+           std::tuple{Point::Sync, "parent directory", true, std::span<const Fault>{}},
+           std::tuple{Point::Close, "DB directory", true, std::span<const Fault>{}}}) {
+    fs::remove_all(path);
+    KillDuring(directory, {point, target, steps, 0, false, true}, true);
+    LAMINAR_CHECK_EQ(fs::exists(log), installed);
+    const auto initial = installed ? Read(log) : std::string{};
+    if (!installed) {
+      LAMINAR_CHECK(fs::exists(path / "create.tmp"));
+      LAMINAR_CHECK(Error(Inspect(directory)).IsNotFound());
+    }
+    VerifyInFreshProcess(directory, "", std::nullopt);
+    LAMINAR_CHECK(!fs::exists(path / "create.tmp"));
+    LAMINAR_CHECK_EQ(Inspect(directory).value().record_count, 0U);
+    if (installed) {
+      LAMINAR_CHECK_EQ(Read(log), initial);
+    }
+  }
+}
+
+void KillAtMutationBoundaries() {
+  const Scratch scratch;
+  const auto path = scratch.root / "db";
+  const auto directory = path.string();
+  const std::array partial{Fault{0, 17}};
+  const std::array partial_payload{Fault{0, 35}};
+  for (const auto& [point, steps, tail, committed] :
+       std::array{std::tuple{Point::Write, std::span<const Fault>{}, 0U, false},
+                  std::tuple{Point::Write, std::span<const Fault>(partial), 17U, false},
+                  std::tuple{Point::Write, std::span<const Fault>(partial_payload), 35U, false},
+                  std::tuple{Point::DataSync, std::span<const Fault>{}, 0U, true},
+                  std::tuple{Point::BeforePublish, std::span<const Fault>{}, 0U, true},
+                  std::tuple{Point::AfterPublish, std::span<const Fault>{}, 0U, true}}) {
+    InstallFixture(path, kFresh);
+    auto db = DB::Open(directory).value();
+    LAMINAR_CHECK(db->Put("old", "kept").ok());
+    LAMINAR_CHECK(db->Close().ok());
+
+    KillDuring(directory, {point, "data.log", steps, 0, false, true}, false, "new", "value");
+    const auto log = path / "data.log";
+    const auto bytes = Read(log);
+    LAMINAR_CHECK_EQ(Inspect(directory).value().incomplete_tail_bytes, tail);
+    LAMINAR_CHECK_EQ(Read(log), bytes);
+    VerifyInFreshProcess(directory, "new",
+                         committed ? std::optional<std::string_view>("value") : std::nullopt);
+    LAMINAR_CHECK_EQ(Read(log), bytes.substr(0, bytes.size() - tail));
+    auto recovered = DB::Open(directory).value();
+    LAMINAR_CHECK_EQ(recovered->Get("old").value(), "kept");
+    LAMINAR_CHECK(recovered->Close().ok());
+  }
+}
+
+void ReferenceMapAcrossReopens() {
+  const Scratch scratch;
+  constexpr std::array<uint32_t, 2> seeds{0x4c4d4e52, 0x52454331};
+  const std::array partial{Fault{0, 5}};
+  for (const uint32_t seed : seeds) {
+    std::cout << "model seed " << seed << ", 6000 operations\n";
+    const auto directory = (scratch.root / std::to_string(seed)).string();
+    std::mt19937 rng(seed);
+    std::array<std::string, 128> keys;
+    for (size_t i = 1; i < keys.size(); ++i) {
+      keys[i] = {static_cast<char>(i), '\0', static_cast<char>(rng() & 0xffU)};
+    }
+    std::unordered_map<std::string, std::string> model;
+    uint64_t writes = 0;
+    auto db = DB::Open(directory).value();
+    const auto CheckValue = [&](const std::string& key) {
+      const auto got = db->Get(key);
+      const auto entry = model.find(key);
+      if (entry == model.end()) {
+        LAMINAR_CHECK(Error(got).IsNotFound());
+      } else {
+        LAMINAR_CHECK_EQ(got.value(), entry->second);
+      }
+    };
+    for (size_t i = 0; i < 6'000; ++i) {
+      const auto& key = keys[rng() % keys.size()];
+      const auto action = rng() % 4;
+      if (action == 0) {
+        std::string value(rng() % 65, '\0');
+        for (char& byte : value) {
+          byte = static_cast<char>(rng() & 0xffU);
+        }
+        LAMINAR_CHECK(db->Put(key, value).ok());
+        model[key] = std::move(value);
+        ++writes;
+      } else if (action == 1) {
+        LAMINAR_CHECK(db->Delete(key).ok());
+        model.erase(key);
+        ++writes;
+      } else {
+        CheckValue(key);
+      }
+      if ((i + 1) % 500 == 0) {
+        LAMINAR_CHECK(db->Close().ok());
+        const auto& interrupted_key = keys[rng() % keys.size()];
+        const std::string new_value{static_cast<char>(rng() & 0xffU), '\0'};
+        const bool complete = rng() % 2 == 0;
+        const Plan kill = complete ? Plan{Point::BeforePublish, "data.log", {}, 0, false, true}
+                                   : Plan{Point::Write, "data.log", partial, 0, false, true};
+        KillDuring(directory, kill, false, interrupted_key, new_value);
+        if (complete) {
+          model[interrupted_key] = new_value;
+          ++writes;
+        }
+        const auto info = Inspect(directory).value();
+        LAMINAR_CHECK_EQ(info.record_count, writes);
+        LAMINAR_CHECK_EQ(info.incomplete_tail_bytes, complete ? 0U : 5U);
+        LAMINAR_CHECK_EQ(info.live_keys, model.size());
+        db = DB::Open(directory).value();
+        for (const auto& candidate : keys) {
+          CheckValue(candidate);
+        }
+      }
+    }
+    LAMINAR_CHECK(db->Close().ok());
+  }
+}
+
+} // namespace
+
+int main() {
+  return laminar::test::Run({{"partial transfers, EINTR and offsets", TransferAndOffsetHandling},
+                             {"creation syscall failures", CreationFailures},
+                             {"recovery syscall failures", RecoveryFailures},
+                             {"ambiguous writes disable handle", AmbiguousWrites},
+                             {"allocation and read failures", AllocationAndReadFailures},
+                             {"explicit close errors", ExplicitCloseErrors},
+                             {"SIGKILL during creation", KillAtCreationBoundaries},
+                             {"SIGKILL during mutation", KillAtMutationBoundaries},
+                             {"12,000-operation reference map", ReferenceMapAcrossReopens}});
+}

@@ -1,7 +1,10 @@
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -15,6 +18,25 @@
 #include "test_harness.h"
 
 namespace {
+std::atomic_bool allocation_probe_enabled{false};
+std::atomic_size_t allocation_probe_count{0};
+} // namespace
+
+void* operator new(std::size_t size) {
+  if (allocation_probe_enabled.load(std::memory_order_relaxed)) {
+    allocation_probe_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (void* allocation = std::malloc(size == 0U ? 1U : size)) {
+    return allocation;
+  }
+  throw std::bad_alloc{};
+}
+
+void operator delete(void* allocation) noexcept { std::free(allocation); }
+
+void operator delete(void* allocation, std::size_t) noexcept { std::free(allocation); }
+
+namespace {
 
 void StatusAndResult() {
   LAMINAR_CHECK(laminar::Status::OK().ok());
@@ -24,6 +46,21 @@ void StatusAndResult() {
   const laminar::Result<int> result = 42;
   LAMINAR_CHECK(result.has_value());
   LAMINAR_CHECK_EQ(*result, 42);
+}
+
+void CodeOnlyErrorStatusDoesNotAllocate() {
+  using Code = laminar::Status::Code;
+  static_assert(noexcept(laminar::Status::FromCode(Code::kIOError)));
+
+  const std::size_t before = allocation_probe_count.load(std::memory_order_relaxed);
+  allocation_probe_enabled.store(true, std::memory_order_relaxed);
+  const auto error = laminar::Status::FromCode(Code::kIOError);
+  allocation_probe_enabled.store(false, std::memory_order_relaxed);
+
+  LAMINAR_CHECK_EQ(allocation_probe_count.load(std::memory_order_relaxed) - before, 0U);
+  LAMINAR_CHECK(error.IsIOError());
+  LAMINAR_CHECK(error.message().empty());
+  LAMINAR_CHECK_EQ(error.ToString(), "IOError");
 }
 
 void SliceIsBinarySafe() {
@@ -157,6 +194,7 @@ void SkipListOrderingAndDuplicates() {
 int main() {
   return laminar::test::Run({
       {"status and result", StatusAndResult},
+      {"code-only error status", CodeOnlyErrorStatusDoesNotAllocate},
       {"binary-safe Slice", SliceIsBinarySafe},
       {"fixed and varint round trips", FixedAndVarintRoundTrips},
       {"malformed varints", MalformedVarintsAreRejected},
