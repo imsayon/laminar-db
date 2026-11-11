@@ -163,6 +163,24 @@ Status File::Append(std::string_view bytes) const {
   return Status::OK();
 }
 
+Status File::WriteAt(uint64_t offset, std::string_view bytes) const {
+  if (offset > kMaxOffset || bytes.size() > kMaxOffset - offset) {
+    return FileError("pwrite extent", label_, EOVERFLOW);
+  }
+  while (!bytes.empty()) {
+    const auto count = Retry(Point::PositionedWrite, label_, [&](Fault fault) {
+      return ::pwrite(fd_, bytes.data(), std::min(bytes.size(), fault.limit),
+                      static_cast<off_t>(offset));
+    });
+    if (count <= 0) {
+      return FileError("pwrite", label_, count < 0 ? errno : EIO);
+    }
+    offset += static_cast<size_t>(count);
+    bytes.remove_prefix(static_cast<size_t>(count));
+  }
+  return Status::OK();
+}
+
 Status File::Truncate(uint64_t size) const {
   if (size > kMaxOffset) {
     return FileError("truncate extent", label_, EOVERFLOW);
@@ -208,6 +226,14 @@ Status InstallFile(int directory, const char* temp, const char* destination) {
     const int error = errno;
     return FileError("install as", destination, error,
                      error == EEXIST ? Status::Code::kAlreadyExists : Status::Code::kIOError);
+  }
+  return Status::OK();
+}
+
+Status ReplaceFile(int directory, const char* temp, const char* destination) {
+  if (Retry(Point::Rename, temp,
+            [&](Fault) { return ::renameat(directory, temp, directory, destination); }) < 0) {
+    return FileError("replace", destination, errno);
   }
   return Status::OK();
 }

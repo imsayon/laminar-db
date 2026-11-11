@@ -23,6 +23,7 @@
 
 #include "laminar/db.h"
 #include "storage/file.h"
+#include "storage/format.h"
 #include "storage_test_support.h"
 #include "v1_fixtures.h"
 
@@ -146,6 +147,8 @@ void TransferAndOffsetHandling() {
   LAMINAR_CHECK(Error(file.Read(kMaxOffset, bytes)).IsIOError());
   LAMINAR_CHECK(Error(file.Read(kMaxOffset + 1, {})).IsIOError());
   LAMINAR_CHECK(file.Truncate(kMaxOffset + 1).IsIOError());
+  LAMINAR_CHECK(file.WriteAt(kMaxOffset, "x").IsIOError());
+  LAMINAR_CHECK(file.WriteAt(kMaxOffset + 1, {}).IsIOError());
   LAMINAR_CHECK_EQ(file.Read(file.Size().value(), bytes).value(), 0U);
   LAMINAR_CHECK((::fcntl(file.fd(), F_GETFD) & FD_CLOEXEC) != 0);
   LAMINAR_CHECK(file.Close().ok());
@@ -528,11 +531,15 @@ void ExplicitCloseErrors() {
   }
 }
 
-void KillDuring(const std::string& directory, Plan plan, const WriteBatch* batch = nullptr) {
+void KillDuring(const std::string& directory, Plan plan, const WriteBatch* batch = nullptr,
+                bool compact = false) {
   const pid_t child = ::fork();
   LAMINAR_CHECK(child >= 0);
   if (child == 0) {
-    if (batch == nullptr) {
+    if (compact) {
+      const WithFault inject(plan);
+      (void)Compact(directory);
+    } else if (batch == nullptr) {
       const WithFault inject(plan);
       (void)DB::Open(directory);
     } else {
@@ -738,11 +745,222 @@ void ReferenceMapAcrossReopens() {
   }
 }
 
+void CompactionFailuresAndKills() {
+  const Scratch scratch;
+  const auto path = scratch.root / "compact";
+  const auto directory = path.string();
+  const auto log = path / "data.log";
+  const auto temp = path / "compact.tmp";
+  InstallFixture(path, kMixed);
+  const size_t descriptors = DescriptorCount();
+  const auto reset = [&] {
+    Write(log, kMixed);
+    Write(temp, kFileMagic);
+  };
+  size_t failures = 0;
+  size_t kills = 0;
+  for (const auto& [point, target] : std::array{std::pair{Point::Open, "parent directory"},
+                                                std::pair{Point::Open, "DB directory"},
+                                                std::pair{Point::Open, "LOCK"},
+                                                std::pair{Point::Open, "data.log"},
+                                                std::pair{Point::Open, "compact.tmp"},
+                                                std::pair{Point::Stat, "parent directory"},
+                                                std::pair{Point::Stat, "DB directory"},
+                                                std::pair{Point::Stat, "LOCK"},
+                                                std::pair{Point::Stat, "data.log"},
+                                                std::pair{Point::Stat, "compact.tmp"},
+                                                std::pair{Point::Lock, "LOCK"},
+                                                std::pair{Point::Read, "data.log"},
+                                                std::pair{Point::Read, "compact.tmp"},
+                                                std::pair{Point::Write, "compact.tmp"},
+                                                std::pair{Point::PositionedWrite, "compact.tmp"},
+                                                std::pair{Point::Sync, "compact.tmp"},
+                                                std::pair{Point::Close, "compact.tmp"},
+                                                std::pair{Point::Unlink, "compact.tmp"},
+                                                std::pair{Point::Rename, "compact.tmp"},
+                                                std::pair{Point::Sync, "DB directory"},
+                                                std::pair{Point::Close, "data.log"},
+                                                std::pair{Point::Close, "parent directory"},
+                                                std::pair{Point::Close, "DB directory"},
+                                                std::pair{Point::Close, "LOCK"}}) {
+    reset();
+    Plan count{point, target};
+    {
+      const WithFault inject(count);
+      LAMINAR_CHECK(Compact(directory).ok());
+    }
+    LAMINAR_CHECK(count.calls > 0);
+    for (size_t nth = 0; nth < count.calls; ++nth) {
+      reset();
+      const std::array error{Fault{EIO}};
+      Plan plan{point, target, error, nth};
+      Status failed;
+      {
+        const WithFault inject(plan);
+        failed = Compact(directory);
+      }
+      LAMINAR_CHECK(failed.IsIOError());
+      const bool installed = (point == Point::Sync && target == std::string_view("DB directory")) ||
+                             (point == Point::Close && target != std::string_view("compact.tmp"));
+      LAMINAR_CHECK_EQ(Read(log), installed ? kCheckpoint : kMixed);
+      if (installed) {
+        LAMINAR_CHECK(failed.message().find(point == Point::Sync ? "uncertain" : "installed") !=
+                      std::string::npos);
+      }
+      LAMINAR_CHECK_EQ(DescriptorCount(), descriptors);
+      VerifyInFreshProcess(directory, {{std::string_view("a\0", 2), std::string_view("\0\xff", 2)},
+                                       {"", std::nullopt}});
+      ++failures;
+
+      // Stop at each real syscall boundary without destructor cleanup, then kill the owner.
+      reset();
+      const pid_t child = ::fork();
+      LAMINAR_CHECK(child >= 0);
+      if (child == 0) {
+        Plan stop{point, target, {}, nth, false, true};
+        const WithFault inject(stop);
+        (void)Compact(directory);
+        ::_exit(99);
+      }
+      int state = 0;
+      LAMINAR_CHECK_EQ(::waitpid(child, &state, WUNTRACED), child);
+      LAMINAR_CHECK(WIFSTOPPED(state));
+      const auto visible = Read(log);
+      LAMINAR_CHECK_EQ(visible, installed ? kCheckpoint : kMixed);
+      if (point == Point::Rename) {
+        LAMINAR_CHECK(Compact(directory).IsAlreadyExists());
+        LAMINAR_CHECK(Error(Inspect(directory)).IsAlreadyExists());
+      }
+      LAMINAR_CHECK_EQ(::kill(child, SIGKILL), 0);
+      LAMINAR_CHECK_EQ(::waitpid(child, &state, 0), child);
+      LAMINAR_CHECK(WIFSIGNALED(state));
+      LAMINAR_CHECK_EQ(WTERMSIG(state), SIGKILL);
+      const bool orphan = fs::exists(temp);
+      const auto orphan_bytes = orphan ? Read(temp) : std::string{};
+      VerifyInFreshProcess(directory, {{std::string_view("a\0", 2), std::string_view("\0\xff", 2)},
+                                       {"", std::nullopt}});
+      LAMINAR_CHECK_EQ(Read(log), visible);
+      LAMINAR_CHECK_EQ(fs::exists(temp), orphan);
+      if (orphan) {
+        LAMINAR_CHECK_EQ(Read(temp), orphan_bytes);
+      }
+      LAMINAR_CHECK(Compact(directory).ok());
+      LAMINAR_CHECK_EQ(Read(log), kCheckpoint);
+      LAMINAR_CHECK(!fs::exists(temp));
+      ++kills;
+    }
+  }
+  std::cout << "compaction injected failures=" << failures << " SIGKILL boundaries=" << kills
+            << '\n';
+
+  // Real partial transfers and EINTR include the positioned header backfill.
+  const std::array transfers{Fault{EINTR}, Fault{0, 1}, Fault{0, 3}};
+  for (const auto point :
+       {Point::Read, Point::Write, Point::PositionedWrite, Point::Sync, Point::Rename}) {
+    reset();
+    Plan plan{point, "compact.tmp", transfers};
+    {
+      const WithFault inject(plan);
+      LAMINAR_CHECK(Compact(directory).ok());
+    }
+    LAMINAR_CHECK_EQ(Read(log), kCheckpoint);
+  }
+  for (const auto point : {Point::Write, Point::PositionedWrite}) {
+    for (const auto fault : {Fault{ENOSPC}, Fault{0, 0}}) {
+      reset();
+      const std::array steps{Fault{0, 3}, fault};
+      Plan plan{point, "compact.tmp", steps};
+      {
+        const WithFault inject(plan);
+        LAMINAR_CHECK(Compact(directory).IsIOError());
+      }
+      LAMINAR_CHECK_EQ(Read(log), kMixed);
+      LAMINAR_CHECK(!fs::exists(temp));
+    }
+  }
+  reset();
+  fault_hook = [](Point point, std::string_view target) noexcept -> Fault {
+    if (target == "compact.tmp" && point == Point::Write) {
+      return {ENOSPC};
+    }
+    if (target == "compact.tmp" && point == Point::Unlink) {
+      return {EACCES};
+    }
+    return {};
+  };
+  fs::remove(temp);
+  const auto primary = Compact(directory);
+  fault_hook = nullptr;
+  LAMINAR_CHECK(primary.IsIOError());
+  LAMINAR_CHECK(primary.message().find("errno " + std::to_string(ENOSPC)) != std::string::npos);
+  LAMINAR_CHECK(fs::exists(temp));
+  LAMINAR_CHECK_EQ(Read(log), kMixed);
+  fs::remove(temp);
+
+  // No short read within the captured extent is accepted, including output validation.
+  for (const auto target : {"data.log", "compact.tmp"}) {
+    reset();
+    const std::array eof{Fault{0, 0}};
+    Plan plan{Point::Read, target, eof, target == std::string_view("compact.tmp") ? 1U : 0U};
+    {
+      const WithFault inject(plan);
+      LAMINAR_CHECK(Compact(directory).IsCorruption());
+    }
+    LAMINAR_CHECK_EQ(Read(log), kMixed);
+  }
+
+  for (const auto point : {Point::Write, Point::PositionedWrite}) {
+    reset();
+    const std::string source = std::string(kMixed) + "LMBT";
+    Write(log, source);
+    fs::remove(temp);
+    const std::array partial{Fault{0, 3}};
+    KillDuring(directory, Plan{point, "compact.tmp", partial, 0, false, true}, nullptr, true);
+    LAMINAR_CHECK_EQ(Read(log), source);
+    LAMINAR_CHECK(fs::exists(temp));
+    LAMINAR_CHECK_EQ(Inspect(directory)->incomplete_tail_bytes, 4U);
+    VerifyInFreshProcess(directory, {{std::string_view("a\0", 2), std::string_view("\0\xff", 2)}});
+    LAMINAR_CHECK_EQ(Read(log), kMixed);
+    LAMINAR_CHECK(Compact(directory).ok());
+    LAMINAR_CHECK_EQ(Read(log), kCheckpoint);
+  }
+  reset();
+  Write(log, std::string(kMixed) + "LMBT");
+  const auto source_with_tail = Read(log);
+  const std::array no_space{Fault{ENOSPC}};
+  Plan failed_copy{Point::Write, "compact.tmp", no_space};
+  {
+    const WithFault inject(failed_copy);
+    LAMINAR_CHECK(Compact(directory).IsIOError());
+  }
+  LAMINAR_CHECK_EQ(Read(log), source_with_tail);
+  LAMINAR_CHECK(Compact(directory).ok());
+  LAMINAR_CHECK_EQ(Read(log), kCheckpoint);
+
+  size_t allocation_failures = 0;
+  for (int nth = 0; nth < 200; ++nth) {
+    reset();
+    allocations_before_failure = nth;
+    const auto result = Compact(directory);
+    allocations_before_failure = -1;
+    LAMINAR_CHECK_EQ(DescriptorCount(), descriptors);
+    if (result.ok()) {
+      break;
+    }
+    LAMINAR_CHECK(result.IsFull());
+    LAMINAR_CHECK_EQ(Read(log), kMixed);
+    ++allocation_failures;
+  }
+  LAMINAR_CHECK(allocation_failures > 0 && allocation_failures < 200);
+  std::cout << "compaction allocation failures=" << allocation_failures << '\n';
+}
+
 } // namespace
 
 int main() {
   return laminar::test::Run({{"partial transfers, EINTR and offsets", TransferAndOffsetHandling},
                              {"creation syscall failures", CreationFailures},
+                             {"compaction faults and SIGKILL", CompactionFailuresAndKills},
                              {"recovery syscall failures", RecoveryFailures},
                              {"ambiguous writes disable handle", AmbiguousWrites},
                              {"batch allocations and one sync", BatchAllocationAndSync},

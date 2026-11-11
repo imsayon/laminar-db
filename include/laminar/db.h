@@ -22,6 +22,9 @@ struct Inspection {
 
 [[nodiscard]] Result<Inspection> Inspect(std::string_view directory) noexcept;
 
+// Offline replacement: requires an existing store and exclusive ownership.
+[[nodiscard]] Status Compact(std::string_view directory) noexcept;
+
 class WriteBatch {
 public:
   WriteBatch() = default;

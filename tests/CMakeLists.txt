@@ -10,6 +10,7 @@ laminar_add_test(laminar_memtable_tests test_memtable.cpp)
 laminar_add_test(laminar_primitives_tests test_primitives.cpp)
 laminar_add_test(laminar_format_tests test_format.cpp)
 laminar_add_test(laminar_db_tests test_db.cpp)
+laminar_add_test(laminar_compaction_tests test_compaction.cpp)
 laminar_add_test(laminar_storage_failure_tests test_storage_failures.cpp)
 add_test(NAME laminar_cli_tests
   COMMAND ${CMAKE_COMMAND} -DCLI=$<TARGET_FILE:laminar> -P ${CMAKE_CURRENT_SOURCE_DIR}/test_cli.cmake)

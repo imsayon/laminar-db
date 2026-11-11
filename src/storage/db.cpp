@@ -25,6 +25,7 @@ using Code = Status::Code;
 constexpr char kLog[] = "data.log";
 constexpr char kLock[] = "LOCK";
 constexpr char kTemp[] = "create.tmp";
+constexpr char kCompactTemp[] = "compact.tmp";
 constexpr char kDirectory[] = "DB directory";
 constexpr char kParent[] = "parent directory";
 constexpr int kDirectoryFlags = O_RDONLY | O_DIRECTORY;
@@ -123,8 +124,8 @@ Status ReadExact(const File& file, uint64_t offset, std::span<char> bytes) {
   return *size == bytes.size() ? Status::OK() : Corrupt("unexpected EOF inside log extent");
 }
 
-Status RemoveStaleTemp(int directory) {
-  auto temp = File::OpenAt(directory, kTemp, kTemp, O_RDONLY | O_NOFOLLOW, Code::kAlreadyExists);
+Status RemoveStaleTemp(int directory, const char* name) {
+  auto temp = File::OpenAt(directory, name, name, O_RDONLY | O_NOFOLLOW, Code::kAlreadyExists);
   if (!temp) {
     return temp.error().IsNotFound() ? Status::OK() : std::move(temp).error();
   }
@@ -136,18 +137,18 @@ Status RemoveStaleTemp(int directory) {
   const size_t prefix = static_cast<size_t>(std::min<uint64_t>(*size, magic.size()));
   LAMINAR_RETURN_IF_ERROR(ReadExact(*temp, 0, std::span(magic).first(prefix)));
   if (!kFileMagic.starts_with(std::string_view(magic.data(), prefix))) {
-    return Status::AlreadyExists("unrecognized create.tmp");
+    return Status::AlreadyExists(std::string("unrecognized ") + name);
   }
   LAMINAR_RETURN_IF_ERROR(temp->Close());
-  LAMINAR_RETURN_IF_ERROR(RemoveFile(directory, kTemp));
+  LAMINAR_RETURN_IF_ERROR(RemoveFile(directory, name));
   if (*size == 0) {
-    std::fputs("LaminarDB removed empty create.tmp\n", stderr);
+    std::fprintf(stderr, "LaminarDB removed empty %s\n", name);
   }
   return Status::OK();
 }
 
 Status CreateLog(int directory) {
-  LAMINAR_RETURN_IF_ERROR(RemoveStaleTemp(directory));
+  LAMINAR_RETURN_IF_ERROR(RemoveStaleTemp(directory, kTemp));
   FileHeader header;
   do {
     LAMINAR_RETURN_IF_ERROR(RandomBytes(header.id));
@@ -520,6 +521,123 @@ Result<Inspection> Inspect(std::string_view directory) noexcept try {
                     replay->size - replay->offset};
 } catch (...) {
   return std::unexpected(CurrentException());
+}
+
+Status Compact(std::string_view directory) noexcept try {
+  auto locked = LockDirectory(directory, false);
+  if (!locked) {
+    return std::move(locked).error();
+  }
+  auto log = File::OpenAt(locked->dir.fd(), kLog, kLog, O_RDONLY | O_NOFOLLOW);
+  if (!log) {
+    return std::move(log).error();
+  }
+  auto replay = Scan(*log);
+  if (!replay) {
+    return std::move(replay).error();
+  }
+  LAMINAR_RETURN_IF_ERROR(RemoveStaleTemp(locked->dir.fd(), kCompactTemp));
+  auto output = File::OpenAt(locked->dir.fd(), kCompactTemp, kCompactTemp,
+                             O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW);
+  if (!output) {
+    return std::move(output).error();
+  }
+  bool installed = false;
+  bool directory_synced = false;
+  auto status = [&]() -> Status {
+    try {
+      std::string placeholder(kFileHeaderBytes, '\0');
+      placeholder.replace(0, kFileMagic.size(), kFileMagic);
+      LAMINAR_RETURN_IF_ERROR(output->Append(placeholder));
+      FileHeader header{replay->header.id, replay->frontier, 0, 0};
+      uint32_t seal_crc = 0;
+      std::string scratch;
+      uint64_t offset = kFileHeaderBytes;
+      const uint64_t rows_end = offset + replay->header.row_bytes;
+      while (offset < replay->offset) {
+        if (offset == rows_end) {
+          offset += kSealBytes;
+          continue;
+        }
+        const auto kind = offset < rows_end ? Kind::Baseline : Kind::Mutation;
+        auto frame = ReadFrameHeader(*log, offset, kind);
+        if (!frame) {
+          return std::move(frame).error();
+        }
+        auto ops = ReadPayload(*log, offset, *frame, kind, scratch);
+        if (!ops) {
+          return std::move(ops).error();
+        }
+        for (size_t ordinal = 0; ordinal < ops->size(); ++ordinal) {
+          const auto& op = (*ops)[ordinal];
+          const auto live = replay->index.find(op.key);
+          if (live == replay->index.end() || live->second.offset != offset ||
+              live->second.ordinal != ordinal) {
+            continue;
+          }
+          auto row = EncodeFrame(Kind::Baseline, 0, std::span(&op, 1));
+          if (!row) {
+            return std::move(row).error();
+          }
+          if (row->size() > kMaxOffset - kFileHeaderBytes - kSealBytes - header.row_bytes) {
+            return Status::Full("maximum checkpoint offset");
+          }
+          LAMINAR_RETURN_IF_ERROR(output->Append(*row));
+          seal_crc = crc32c::Extend(seal_crc, row->data() + kFrameHeaderBytes,
+                                    row->size() - kFrameHeaderBytes);
+          ++header.row_count;
+          header.row_bytes += row->size();
+        }
+        offset += kFrameHeaderBytes + frame->payload_bytes;
+      }
+      LAMINAR_RETURN_IF_ERROR(output->Append(EncodeSeal(seal_crc)));
+      LAMINAR_RETURN_IF_ERROR(output->WriteAt(0, EncodeFileHeader(header)));
+      auto verified = Scan(*output);
+      if (!verified) {
+        return std::move(verified).error();
+      }
+      if (verified->offset != verified->size || verified->records != 0 ||
+          verified->header.id != header.id || verified->frontier != header.floor ||
+          verified->index.size() != replay->index.size()) {
+        return Corrupt("checkpoint verification mismatch");
+      }
+      LAMINAR_RETURN_IF_ERROR(output->Sync(Point::Sync));
+      LAMINAR_RETURN_IF_ERROR(output->Close());
+      LAMINAR_RETURN_IF_ERROR(ReplaceFile(locked->dir.fd(), kCompactTemp, kLog));
+      installed = true;
+      LAMINAR_RETURN_IF_ERROR(locked->dir.Sync(Point::Sync));
+      directory_synced = true;
+      return Status::OK();
+    } catch (...) {
+      return CurrentException();
+    }
+  }();
+  const auto collect = [&](Status cleanup) {
+    if (cleanup.ok()) {
+      return;
+    }
+    if (status.ok()) {
+      status = std::move(cleanup);
+    } else {
+      std::fprintf(stderr, "LaminarDB compaction cleanup: %s\n", cleanup.message().c_str());
+    }
+  };
+  collect(output->Close());
+  if (!installed) {
+    collect(RemoveFile(locked->dir.fd(), kCompactTemp));
+  }
+  collect(log->Close());
+  collect(locked->parent.Close());
+  collect(locked->dir.Close());
+  collect(locked->lock.Close());
+  if (installed && !status.ok()) {
+    const auto outcome = directory_synced ? "compaction installed; cleanup failed: "
+                                          : "uncertain compaction installation: ";
+    return Status::IOError(std::string(outcome) + status.ToString());
+  }
+  return status;
+} catch (...) {
+  return CurrentException();
 }
 
 Status DB::Put(Slice key, Slice value) noexcept {

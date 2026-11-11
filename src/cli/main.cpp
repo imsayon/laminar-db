@@ -127,7 +127,12 @@ std::string EncodeHex(std::string_view bytes) {
 
 int Run(std::string_view command, std::string_view directory, const char* argument,
         std::string_view value_hex) {
-  if (command == "inspect") {
+  if (command == "compact") {
+    const auto status = laminar::Compact(directory);
+    if (!status.ok()) {
+      return Fail(status);
+    }
+  } else if (command == "inspect") {
     const auto info = laminar::Inspect(directory);
     if (!info) {
       return Fail(info.error());
@@ -191,14 +196,15 @@ int main(int argc, char** argv) try {
   const std::string_view command = argc > 1 ? argv[1] : "";
   if ((command == "put" && argc == 5) ||
       ((command == "get" || command == "delete" || command == "batch") && argc == 4) ||
-      (command == "inspect" && argc == 3)) {
+      ((command == "inspect" || command == "compact") && argc == 3)) {
     return Run(command, argv[2], argc >= 4 ? argv[3] : "", argc == 5 ? argv[4] : "");
   }
   std::cerr << "usage: laminar put DIRECTORY KEY_HEX VALUE_HEX\n"
                "       laminar get DIRECTORY KEY_HEX\n"
                "       laminar delete DIRECTORY KEY_HEX\n"
                "       laminar batch DIRECTORY INPUT_FILE\n"
-               "       laminar inspect DIRECTORY\n";
+               "       laminar inspect DIRECTORY\n"
+               "       laminar compact DIRECTORY\n";
   return 3;
 } catch (const std::bad_alloc&) {
   std::fputs("Full\n", stderr);

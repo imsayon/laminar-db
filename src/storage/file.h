@@ -18,6 +18,7 @@ enum class Point : uint8_t {
   Lock,
   Read,
   Write,
+  PositionedWrite,
   DataSync,
   Sync,
   Truncate,
@@ -57,6 +58,8 @@ public:
   Result<uint64_t> Size() const;
   Result<size_t> Read(uint64_t offset, std::span<char> bytes) const;
   Status Append(std::string_view bytes) const;
+  // Requires a non-O_APPEND descriptor: Linux otherwise ignores the positioned offset.
+  Status WriteAt(uint64_t offset, std::string_view bytes) const;
   Status Truncate(uint64_t size) const;
   Status Sync(Point point) const;
 
@@ -69,6 +72,7 @@ private:
 Status MakeDirectory(int parent, const char* name);
 Status RemoveFile(int directory, const char* name);
 Status InstallFile(int directory, const char* temp, const char* destination);
+Status ReplaceFile(int directory, const char* temp, const char* destination);
 Status RandomBytes(std::span<char> bytes);
 
 } // namespace laminar::storage
