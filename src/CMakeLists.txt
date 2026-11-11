@@ -3,6 +3,8 @@ add_library(laminar_core
   storage/format.cpp
   storage/file.cpp
   storage/db.cpp
+  projection/redis.cpp
+  projection/redis_projection.cpp
   util/crc32c.cpp
   util/status.cpp
 )

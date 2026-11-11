@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install compiler
-        run: sudo apt-get update && sudo apt-get install --yes ${{ matrix.packages }}
+        run: sudo apt-get update && sudo apt-get install --yes ${{ matrix.packages }} redis-server
       - name: Configure
         run: cmake --preset ${{ matrix.preset }} -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}"
       - name: Build
@@ -51,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install GCC 14
-        run: sudo apt-get update && sudo apt-get install --yes g++-14
+        run: sudo apt-get update && sudo apt-get install --yes g++-14 redis-server
       - name: Configure
         run: cmake --preset ${{ matrix.preset }} -DCMAKE_CXX_COMPILER=g++-14
       - name: Build
@@ -71,7 +71,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Clang tools
-        run: sudo apt-get update && sudo apt-get install --yes clang-18 clang-tidy-18 libc++-18-dev libc++abi-18-dev
+        run: sudo apt-get update && sudo apt-get install --yes clang-18 clang-tidy-18 libc++-18-dev libc++abi-18-dev redis-server
       - name: Configure
         run: cmake --preset clang-tidy -DCMAKE_CXX_COMPILER=clang++-18 -DCMAKE_CXX_FLAGS=-stdlib=libc++ -DCMAKE_CXX_CLANG_TIDY=clang-tidy-18
       - name: Analyze while building
