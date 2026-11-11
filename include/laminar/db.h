@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -11,6 +12,30 @@
 #include "laminar/status.h"
 
 namespace laminar {
+
+struct ChangeCursor {
+  std::array<char, 16> db_id{};
+  uint64_t sequence{};
+  friend bool operator==(const ChangeCursor&, const ChangeCursor&) = default;
+};
+
+struct Change {
+  enum class Type : uint8_t { Put = 1, Delete = 2 };
+  Type type;
+  std::string key;
+  std::string value;
+};
+
+struct CommittedBatch {
+  ChangeCursor cursor;
+  std::vector<Change> operations;
+  size_t encoded_bytes{};
+};
+
+struct ChangePage {
+  std::vector<CommittedBatch> batches;
+  size_t required_bytes{};
+};
 
 struct Inspection {
   uint32_t format_version;
@@ -64,6 +89,11 @@ public:
   // Publish in batch order after syncing. An error can follow a durable write.
   // The caller must keep the batch alive and unchanged until Write returns.
   [[nodiscard]] Status Write(const WriteBatch& batch) noexcept;
+  [[nodiscard]] Result<ChangeCursor> LatestSequence() noexcept;
+  // Exclusive logical cursor; NotFound means history expired. Limits must be positive.
+  // Byte limits count whole encoded frames. No partial page escapes on error.
+  [[nodiscard]] Result<ChangePage> ReadChangesAfter(ChangeCursor after, size_t max_batches,
+                                                    size_t max_bytes) noexcept;
   [[nodiscard]] Status Close() noexcept;
 
 private:

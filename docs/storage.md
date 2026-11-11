@@ -134,3 +134,18 @@ Mutation sequences begin at B+1 and increase by one per nonempty batch, regardle
 of its operation count. Repeat-key operations apply in order. The
 [golden fixtures](../tests/v1_fixtures.h) and [parser tests](../tests/test_format.cpp)
 are executable byte examples. Internal format definitions are not a public API.
+
+## Committed changes
+
+`LatestSequence()` returns the persistent database identity and current u64 sequence.
+`ReadChangesAfter(cursor, max_batches, max_bytes)` uses an exclusive cursor and returns
+owned, consecutive, whole mutation batches. Both limits must be positive; bytes count the
+32-byte frame header plus encoded payload. An empty page with `required_bytes > 0` means
+the first batch does not fit. An empty page with zero required bytes means the cursor is
+at the frontier. Any read/validation error returns no page.
+
+Foreign/future cursors return InvalidArgument. A cursor below the replay floor returns
+NotFound (history expired); compaction sets that floor to the captured frontier, including
+an all-deleted store. Baseline rows are state, not changes. Persist identity and sequence,
+never file offsets. Complete recovered frames become visible only after Open syncs the
+recovered frontier; this includes writes whose caller did not receive success.

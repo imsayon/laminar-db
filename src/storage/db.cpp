@@ -419,6 +419,8 @@ struct DB::Impl {
   uint64_t frontier;
   uint64_t offset;
   State state{State::Healthy};
+  uint64_t read_sequence{header.floor};
+  uint64_t read_offset{kFileHeaderBytes + header.row_bytes + kSealBytes};
 };
 
 Status WriteBatch::Put(Slice key, Slice value) noexcept { return Add(key, value, false); }
@@ -677,6 +679,84 @@ Result<std::string> DB::Get(Slice key) noexcept try {
     impl_->state = Impl::State::ReopenRequired;
   }
   return value;
+} catch (...) {
+  return std::unexpected(CurrentException());
+}
+
+Result<ChangeCursor> DB::LatestSequence() noexcept try {
+  std::lock_guard guard(impl_->mutex);
+  if (auto status = impl_->CheckHealthy(); !status.ok()) {
+    return std::unexpected(std::move(status));
+  }
+  return ChangeCursor{impl_->header.id, impl_->frontier};
+} catch (...) {
+  return std::unexpected(CurrentException());
+}
+
+Result<ChangePage> DB::ReadChangesAfter(ChangeCursor after, size_t max_batches,
+                                        size_t max_bytes) noexcept try {
+  std::lock_guard guard(impl_->mutex);
+  if (auto status = impl_->CheckHealthy(); !status.ok()) {
+    return std::unexpected(std::move(status));
+  }
+  if (after.db_id != impl_->header.id || after.sequence > impl_->frontier || max_batches == 0 ||
+      max_bytes == 0) {
+    return std::unexpected(Status::InvalidArgument("foreign/future cursor or zero change limit"));
+  }
+  if (after.sequence < impl_->header.floor) {
+    return std::unexpected(Status::NotFound("change history expired; rebuild required"));
+  }
+  ChangePage page;
+  if (after.sequence == impl_->frontier) {
+    return page;
+  }
+  uint64_t sequence = impl_->header.floor;
+  uint64_t offset = kFileHeaderBytes + impl_->header.row_bytes + kSealBytes;
+  if (after.sequence >= impl_->read_sequence) {
+    sequence = impl_->read_sequence;
+    offset = impl_->read_offset;
+  }
+  size_t used = 0;
+  std::string scratch;
+  while (sequence < impl_->frontier && page.batches.size() < max_batches) {
+    auto frame = ReadFrameHeader(impl_->log, offset, Kind::Mutation);
+    if (!frame) {
+      impl_->state = Impl::State::ReopenRequired;
+      return std::unexpected(std::move(frame).error());
+    }
+    const size_t length = kFrameHeaderBytes + frame->payload_bytes;
+    if (frame->sequence != sequence + 1 || offset > impl_->offset ||
+        length > impl_->offset - offset) {
+      impl_->state = Impl::State::ReopenRequired;
+      return std::unexpected(Corrupt("change sequence or extent mismatch"));
+    }
+    auto ops = ReadPayload(impl_->log, offset, *frame, Kind::Mutation, scratch);
+    if (!ops) {
+      impl_->state = Impl::State::ReopenRequired;
+      return std::unexpected(std::move(ops).error());
+    }
+    if (sequence >= after.sequence) {
+      if (length > max_bytes - used) {
+        if (page.batches.empty()) {
+          page.required_bytes = length;
+        }
+        break;
+      }
+      CommittedBatch batch{{impl_->header.id, frame->sequence}, {}, length};
+      batch.operations.reserve(ops->size());
+      for (const auto& op : *ops) {
+        batch.operations.push_back({op.tag == Tag::Put ? Change::Type::Put : Change::Type::Delete,
+                                    std::string(op.key), std::string(op.value)});
+      }
+      page.batches.push_back(std::move(batch));
+      used += length;
+    }
+    sequence = frame->sequence;
+    offset += length;
+  }
+  impl_->read_sequence = sequence;
+  impl_->read_offset = offset;
+  return page;
 } catch (...) {
   return std::unexpected(CurrentException());
 }
