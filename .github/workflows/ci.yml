@@ -18,7 +18,7 @@ jobs:
             compiler: g++-14
             preset: gcc-debug
           - name: clang
-            packages: clang-18 libc++-18-dev libc++abi-18-dev
+            packages: clang-18 libc++-18-dev libc++abi-18-dev libclang-rt-18-dev
             compiler: clang++-18
             preset: clang-debug
             cxx_flags: -stdlib=libc++
@@ -34,6 +34,12 @@ jobs:
         run: cmake --build --preset ${{ matrix.preset }}
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
+      - name: Decoder fuzz smoke (10000 executions)
+        if: matrix.name == 'clang'
+        run: |
+          cmake --build --preset clang-debug --target laminar_format_fuzz
+          mkdir -p build/fuzz-corpus
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 build/clang-debug/tests/laminar_format_fuzz -seed=70406 -runs=10000 -max_len=16384 -timeout=5 -artifact_prefix=build/ build/fuzz-corpus build/clang-debug/tests/fuzz-seeds
 
   sanitizers:
     runs-on: ubuntu-24.04
@@ -58,7 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check formatting
-        run: find include src tests -type f \( -name '*.h' -o -name '*.cpp' \) -print0 | xargs -0 clang-format --dry-run --Werror
+        run: find include src tests bench -type f \( -name '*.h' -o -name '*.cpp' \) -print0 | xargs -0 clang-format --dry-run --Werror
 
   static-analysis:
     runs-on: ubuntu-24.04

@@ -477,7 +477,7 @@ thread_local PublicationReceipt receipt{};
 void SeededSharedKeyStress() {
   const Scratch scratch;
   constexpr size_t callers = 4;
-  constexpr size_t commits = 1'024;
+  constexpr size_t commits = 4'096;
   constexpr std::array keys{"a", "b", "c", "d", "e", "f", "g", "h"};
   struct Change {
     size_t put;
@@ -486,7 +486,7 @@ void SeededSharedKeyStress() {
     size_t sequence{};
     bool ok{};
   };
-  for (const uint32_t seed : {0x42415443U, 0x53484152U}) {
+  for (const uint32_t seed : {0x42415443U, 0x53484152U, 70401U, 70402U}) {
     std::cout << "shared-key seed " << seed << ", " << commits << " commits\n";
     const auto directory = (scratch.root / std::to_string(seed)).string();
     auto db = DB::Open(directory).value();

@@ -662,7 +662,7 @@ void KillAtMutationBoundaries() {
 
 void ReferenceMapAcrossReopens() {
   const Scratch scratch;
-  constexpr std::array<uint32_t, 2> seeds{0x4c4d4e52, 0x52454331};
+  constexpr std::array<uint32_t, 4> seeds{0x4c4d4e52, 0x52454331, 70403U, 70404U};
   const std::array partial{Fault{0, 5}};
   for (const uint32_t seed : seeds) {
     std::cout << "model seed " << seed << ", 6000 operations\n";
@@ -714,6 +714,43 @@ void ReferenceMapAcrossReopens() {
         CheckValue(key);
       }
       if ((i + 1) % 500 == 0) {
+        // Mix definite pre-append OOM with uncertain sync/publication and partial append failures.
+        const auto& failed_key = keys[rng() % keys.size()];
+        const std::string failed_value{static_cast<char>(rng() & 0xffU), '\0'};
+        batch.Clear();
+        LAMINAR_CHECK(batch.Delete(failed_key).ok());
+        LAMINAR_CHECK(batch.Put(failed_key, failed_value).ok());
+        const size_t failure = (i / 500) % 4;
+        const std::array io_error{Fault{EIO}};
+        const std::array append_error{Fault{0, 5}, Fault{ENOSPC}};
+        Plan plan = failure == 1 ? Plan{Point::Write, "data.log", append_error}
+                                 : Plan{Point::DataSync, "data.log", io_error};
+        if (failure == 3) {
+          plan = {Point::BeforePublish, "data.log", {}, 0, false, false, 0};
+        }
+        Status failed;
+        {
+          const WithFault inject(plan);
+          if (failure == 0) {
+            allocations_before_failure = 0;
+          }
+          failed = db->Write(batch);
+        }
+        LAMINAR_CHECK(failure == 0 || failure == 3 ? failed.IsFull() : failed.IsIOError());
+        if (failure >= 2) {
+          model[failed_key] = failed_value;
+          ++writes;
+        }
+        if (failure == 0) {
+          CheckValue(failed_key);
+        } else {
+          LAMINAR_CHECK(Error(db->Get(failed_key)).IsIOError());
+        }
+        LAMINAR_CHECK(db->Close().ok());
+        db = DB::Open(directory).value();
+        for (const auto& candidate : keys) {
+          CheckValue(candidate);
+        }
         LAMINAR_CHECK(db->Close().ok());
         const auto interrupted = rng() % keys.size();
         const auto& interrupted_key = keys[interrupted];
@@ -731,13 +768,26 @@ void ReferenceMapAcrossReopens() {
           model[interrupted_key] = new_value;
           ++writes;
         }
+        const auto log = fs::path(directory) / "data.log";
+        const auto before_inspect = Read(log);
         const auto info = Inspect(directory).value();
+        LAMINAR_CHECK_EQ(Read(log), before_inspect);
         LAMINAR_CHECK_EQ(info.record_count, writes);
         LAMINAR_CHECK_EQ(info.incomplete_tail_bytes, complete ? 0U : 5U);
         LAMINAR_CHECK_EQ(info.live_keys, model.size());
         db = DB::Open(directory).value();
         for (const auto& candidate : keys) {
           CheckValue(candidate);
+        }
+        if ((i + 1) % 1'000 == 0) {
+          LAMINAR_CHECK(db->Close().ok());
+          LAMINAR_CHECK(Compact(directory).ok());
+          LAMINAR_CHECK(!fs::exists(fs::path(directory) / "compact.tmp"));
+          writes = 0;
+          db = DB::Open(directory).value();
+          for (const auto& candidate : keys) {
+            CheckValue(candidate);
+          }
         }
       }
     }
@@ -969,5 +1019,5 @@ int main() {
                              {"explicit close errors", ExplicitCloseErrors},
                              {"SIGKILL during creation", KillAtCreationBoundaries},
                              {"SIGKILL during mutation", KillAtMutationBoundaries},
-                             {"12,000-operation reference map", ReferenceMapAcrossReopens}});
+                             {"24,000-operation reference map", ReferenceMapAcrossReopens}});
 }
