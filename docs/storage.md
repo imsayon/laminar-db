@@ -40,7 +40,7 @@ Close does not persist an index. There is no record cache, scan or snapshot API.
 
 | Status | Meaning |
 |---|---|
-| NotFound | Absent key, or missing existing-store data for Inspect/Compact |
+| NotFound | Absent key, expired change history, or missing existing-store data for Inspect/Compact |
 | InvalidArgument | Caller/path/CLI/size limits |
 | Full | Allocation failure, exhausted sequence or offset space |
 | Corruption | Invalid stored bytes or unexpected short read |

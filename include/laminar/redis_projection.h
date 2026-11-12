@@ -21,7 +21,13 @@ public:
   RedisProjection(const RedisProjection&) = delete;
   RedisProjection& operator=(const RedisProjection&) = delete;
 
+  // Close/drain projection reads and pause source writes for exact same-watermark comparison.
+  [[nodiscard]] Status Reconcile(DB& source) noexcept;
+  // Explicitly replace only the two owned Redis keys, verify every byte, then publish ready.
+  [[nodiscard]] Status Rebuild(DB& source) noexcept;
+
   // Only feed whole batches returned by this source's ReadChangesAfter.
+  // Keep the batch alive and unchanged until Apply returns.
   [[nodiscard]] Status Apply(const CommittedBatch& batch) noexcept;
   [[nodiscard]] Result<std::string> Get(Slice key) noexcept;
   // Unready after every owner restart or unresolved execution error.

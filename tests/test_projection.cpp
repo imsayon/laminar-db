@@ -53,6 +53,10 @@ void OrderedApplyAndValidation() {
   // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange) -- malformed input regression.
   invalid = Batch(batch.cursor, {{static_cast<Change::Type>(3), key, "bad"}});
   LAMINAR_CHECK(projection->Apply(invalid).IsInvalidArgument());
+  invalid =
+      Batch(batch.cursor, {{Change::Type::Put, key, "must not publish"}, invalid.operations[0]});
+  LAMINAR_CHECK(projection->Apply(invalid).IsInvalidArgument());
+  LAMINAR_CHECK_EQ(projection->Get(key).value(), value);
   invalid = Batch(batch.cursor, {{Change::Type::Delete, key, "bad"}});
   LAMINAR_CHECK(projection->Apply(invalid).IsInvalidArgument());
   invalid = Batch(batch.cursor, {});
@@ -130,6 +134,37 @@ void LostReplyAndOutage() {
   LAMINAR_CHECK(offline->Apply(batch).IsIOError());
   LAMINAR_CHECK(!offline->Cursor());
   LAMINAR_CHECK(!projection->Get("key"));
+}
+
+Fault CountDispatch(Point point) noexcept {
+  if (point == Point::Sent) {
+    ++dispatches;
+  }
+  return {};
+}
+
+void BoundedRetries() {
+  RedisServer server;
+  ChangeCursor zero;
+  zero.db_id[0] = 'x';
+  auto projection = RedisProjection::Open(server.socket, "retries").value();
+  LAMINAR_CHECK(TestAccess::Publish(*projection, zero).ok());
+  const auto batch = Batch(zero, {{Change::Type::Put, "key", "value"}});
+  server.Run({"ACL", "SETUSER", "default", "-hset"});
+  dispatches = 0;
+  fault_hook = CountDispatch;
+  const auto start = std::chrono::steady_clock::now();
+  const auto result = projection->Apply(batch);
+  const auto elapsed =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  fault_hook = nullptr;
+  server.Run({"ACL", "SETUSER", "default", "+hset"});
+  LAMINAR_CHECK(!result.ok());
+  LAMINAR_CHECK_EQ(dispatches, 3U);
+  LAMINAR_CHECK(elapsed >= 0.06);
+  LAMINAR_CHECK(!projection->Get("key"));
+  LAMINAR_CHECK(!server.Run({"HGET", "laminar:retries:data", "key"}));
+  LAMINAR_CHECK_EQ(server.Run({"HGET", "laminar:retries:meta", "seq"}).value(), SequenceHex(0));
 }
 
 std::atomic<bool> sent{false}, release{false};
@@ -271,6 +306,7 @@ int main() {
   return Run(
       {{"ordered apply, duplicate, gap and validation", OrderedApplyAndValidation},
        {"lost reply classification, timeout and outage", LostReplyAndOutage},
+       {"pre-mutation script failures exhaust bounded retries", BoundedRetries},
        {"partial Lua failure closes and drains read admission", PartialFailureClosesAdmission},
        {"owner killed before observing partial-script error", OwnerDeathBeforeErrorReply},
        {"maximum legal source batch on real Redis", MaximumBatch}});

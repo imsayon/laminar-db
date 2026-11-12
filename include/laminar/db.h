@@ -12,6 +12,9 @@
 #include "laminar/status.h"
 
 namespace laminar {
+namespace storage {
+class Maintenance;
+}
 
 struct ChangeCursor {
   std::array<char, 16> db_id{};
@@ -97,6 +100,7 @@ public:
   [[nodiscard]] Status Close() noexcept;
 
 private:
+  friend class storage::Maintenance;
   struct Impl;
   explicit DB(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;

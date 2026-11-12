@@ -2,14 +2,15 @@
 
 A Linux/C++23 embedded binary key-value store built around one append-only log,
 an owned-key RAM hash index, and one mutex. Durable single writes, atomic batches,
-restart recovery, read-only inspection, and offline compaction are implemented.
-This is a storage learning milestone; the change stream and Redis projection are
-still future work. See [verification and readiness](docs/verification.md) for dated evidence.
+restart recovery, read-only inspection, offline compaction, bounded committed changes,
+and one owning-process Redis projection with exact rebuild are implemented.
+See [verification and readiness](docs/verification.md) for evidence and limits.
 
 ## Build and try
 
 Requires Linux x86-64, CMake 3.25+, Make, Git, and GCC 14+ with a C++23 standard library.
-Clang 18 with libc++ 18 is also checked. On Ubuntu 24.04, install `cmake make g++-14`
+Clang 18 with libc++ 18 is also checked. Tests require Redis 7+ and start isolated
+disposable instances. On Ubuntu 24.04, install `cmake make g++-14 redis-server redis-tools`
 and configure with `-DCMAKE_CXX_COMPILER=g++-14`.
 
 ```sh
@@ -91,3 +92,6 @@ after one successful data sync; an empty batch is a healthy-handle no-op.
 [Storage contract and bytes](docs/storage.md) ·
 [Tests, failures, fuzzing and readiness](docs/verification.md) ·
 [Reproducible benchmarks](bench/README.md)
+
+The [committed stream and Redis projection guide](docs/projection.md) documents bounded
+change cursors, guarded replay, exact paused-write rebuild and the isolated runnable demo.

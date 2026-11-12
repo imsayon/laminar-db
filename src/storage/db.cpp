@@ -15,6 +15,7 @@
 #include "laminar/crc32c.h"
 #include "storage/file.h"
 #include "storage/format.h"
+#include "storage/maintenance.h"
 
 namespace laminar {
 namespace {
@@ -423,6 +424,47 @@ struct DB::Impl {
   uint64_t read_offset{kFileHeaderBytes + header.row_bytes + kSealBytes};
 };
 
+namespace storage {
+struct Maintenance::Impl {
+  explicit Impl(DB::Impl& source) : db(source), lock(source.mutex), next(source.index.begin()) {}
+  DB::Impl& db;
+  std::unique_lock<std::mutex> lock;
+  Index::const_iterator next;
+};
+
+Maintenance::Maintenance(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+Maintenance::~Maintenance() = default;
+
+Result<std::unique_ptr<Maintenance>> Maintenance::Pause(DB& db) noexcept try {
+  auto state = std::make_unique<Impl>(*db.impl_);
+  if (auto status = state->db.CheckHealthy(); !status.ok()) {
+    return std::unexpected(std::move(status));
+  }
+  return std::unique_ptr<Maintenance>(new Maintenance(std::move(state)));
+} catch (...) {
+  return std::unexpected(CurrentException());
+}
+
+ChangeCursor Maintenance::Cursor() const { return {impl_->db.header.id, impl_->db.frontier}; }
+size_t Maintenance::Size() const { return impl_->db.index.size(); }
+void Maintenance::Rewind() { impl_->next = impl_->db.index.begin(); }
+
+Result<std::optional<std::pair<std::string, std::string>>> Maintenance::Next() noexcept try {
+  if (impl_->next == impl_->db.index.end()) {
+    return std::optional<std::pair<std::string, std::string>>{};
+  }
+  const auto& [key, entry] = *impl_->next++;
+  auto value = impl_->db.ReadValue(entry, key);
+  if (!value) {
+    impl_->db.state = DB::Impl::State::ReopenRequired;
+    return std::unexpected(std::move(value).error());
+  }
+  return std::optional<std::pair<std::string, std::string>>(std::in_place, key, std::move(*value));
+} catch (...) {
+  return std::unexpected(CurrentException());
+}
+} // namespace storage
+
 Status WriteBatch::Put(Slice key, Slice value) noexcept { return Add(key, value, false); }
 
 Status WriteBatch::Delete(Slice key) noexcept { return Add(key, {}, true); }
@@ -718,7 +760,7 @@ Result<ChangePage> DB::ReadChangesAfter(ChangeCursor after, size_t max_batches,
   }
   size_t used = 0;
   std::string scratch;
-  while (sequence < impl_->frontier && page.batches.size() < max_batches) {
+  while (sequence < impl_->frontier && page.batches.size() < max_batches && used < max_bytes) {
     auto frame = ReadFrameHeader(impl_->log, offset, Kind::Mutation);
     if (!frame) {
       impl_->state = Impl::State::ReopenRequired;

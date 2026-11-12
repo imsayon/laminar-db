@@ -141,6 +141,9 @@ void NoPartialPage() {
   auto bytes = Read(path / "data.log");
   bytes.back() ^= 1;
   Write(path / "data.log", bytes);
+  const auto exact =
+      db->ReadChangesAfter(zero, 10, kFrameHeaderBytes + kOperationBytes + 4).value();
+  LAMINAR_CHECK_EQ(exact.batches.size(), 1U);
   LAMINAR_CHECK(Error(db->ReadChangesAfter(zero, 10, 1000)).IsCorruption());
   LAMINAR_CHECK(Error(db->LatestSequence()).IsIOError());
   LAMINAR_CHECK(db->Close().ok());

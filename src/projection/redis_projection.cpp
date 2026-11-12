@@ -11,6 +11,7 @@
 
 #include "projection/redis.h"
 #include "storage/format.h"
+#include "storage/maintenance.h"
 
 namespace laminar {
 namespace {
@@ -137,6 +138,35 @@ struct RedisProjection::Impl {
     return Status::OK();
   }
 
+  Status Compare(Maintenance& source) const {
+    const auto count = Run({"HLEN", data});
+    if (!count) {
+      return count.error();
+    }
+    if (*count != std::optional<std::string>(std::to_string(source.Size()))) {
+      return Status::IOError("projection cardinality mismatch; rebuild required");
+    }
+    source.Rewind();
+    for (;;) {
+      auto row = source.Next();
+      if (!row) {
+        return std::move(row).error();
+      }
+      if (!*row) {
+        break;
+      }
+      const auto& [key, value] = **row;
+      const auto actual = Run({"HGET", data, key});
+      if (!actual) {
+        return actual.error();
+      }
+      if (!*actual || **actual != value) {
+        return Status::IOError("projection key/value mismatch; rebuild required");
+      }
+    }
+    return Status::OK();
+  }
+
   std::mutex mutex;
   std::string socket, data, meta;
   ChangeCursor cursor;
@@ -173,6 +203,78 @@ Status RedisProjection::PublishReady(ChangeCursor cursor) {
   impl_->cursor = cursor;
   impl_->ready = true;
   return Status::OK();
+}
+
+Status RedisProjection::Reconcile(DB& source) noexcept try {
+  std::lock_guard guard(impl_->mutex);
+  impl_->ready = false;
+  auto stable = Maintenance::Pause(source);
+  if (!stable) {
+    return std::move(stable).error();
+  }
+  const auto cursor = (*stable)->Cursor();
+  const auto marker = impl_->Marker();
+  if (!marker || *marker != impl_->Expected(cursor)) {
+    return marker ? Status::IOError("projection checkpoint mismatch; rebuild required")
+                  : marker.error();
+  }
+  LAMINAR_RETURN_IF_ERROR(impl_->Compare(**stable));
+  const auto verified = impl_->Marker();
+  if (!verified || *verified != impl_->Expected(cursor)) {
+    return verified ? Status::IOError("projection epoch changed during comparison")
+                    : verified.error();
+  }
+  impl_->cursor = cursor;
+  impl_->ready = true;
+  return Status::OK();
+} catch (...) {
+  std::lock_guard guard(impl_->mutex);
+  impl_->ready = false;
+  return Exception();
+}
+
+Status RedisProjection::Rebuild(DB& source) noexcept try {
+  std::lock_guard guard(impl_->mutex);
+  impl_->ready = false;
+  auto stable = Maintenance::Pause(source);
+  if (!stable) {
+    return std::move(stable).error();
+  }
+  const auto cursor = (*stable)->Cursor();
+  const auto cleared = impl_->Run({"DEL", impl_->data, impl_->meta});
+  if (!cleared) {
+    return cleared.error();
+  }
+  const auto closed = impl_->Run({"HSET", impl_->meta, "ready", "0"});
+  if (!closed) {
+    return closed.error();
+  }
+  for (;;) {
+    auto row = (*stable)->Next();
+    if (!row) {
+      return std::move(row).error();
+    }
+    if (!*row) {
+      break;
+    }
+    const auto& [key, value] = **row;
+    const auto result = impl_->Run({"HSET", impl_->data, key, value});
+    if (!result) {
+      return result.error();
+    }
+    if (At(projection::Point::RebuildRow).script_error) {
+      return Status::IOError("injected interrupted projection rebuild");
+    }
+  }
+  LAMINAR_RETURN_IF_ERROR(impl_->Compare(**stable));
+  if (At(projection::Point::BeforeReady).script_error) {
+    return Status::IOError("injected failure before projection publication");
+  }
+  return PublishReady(cursor);
+} catch (...) {
+  std::lock_guard guard(impl_->mutex);
+  impl_->ready = false;
+  return Exception();
 }
 
 Status RedisProjection::Apply(const CommittedBatch& batch) noexcept try {

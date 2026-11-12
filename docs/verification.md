@@ -2,8 +2,8 @@
 
 Use fresh directories under `build/` for clean gates. Ubuntu 24.04 packages for
 the checked toolchain are `cmake make g++-14 clang-18 clang-tidy-18 clang-format-18
-libc++-18-dev libc++abi-18-dev libclang-rt-18-dev python3 git`. Native compiler/runtime
-combinations must actually support C++23 `std::expected`.
+libc++-18-dev libc++abi-18-dev libclang-rt-18-dev python3 git redis-server redis-tools`.
+Native compiler/runtime combinations must actually support C++23 `std::expected`.
 
 ```sh
 cmake --preset gcc-debug -B build/check-gcc -DCMAKE_CXX_COMPILER=g++-14
@@ -112,12 +112,12 @@ persistent engine's write path.
 | Reproducible performance/space observations | [Benchmark report](../bench/results/2026-11-11.md) |
 | Physical power loss / hardware certification | UNKNOWN; no experiment performed |
 | Network filesystem / hostile directory mutation | Unsupported operating model |
-| CDC, Redis projection and reconciliation | Deferred; no public cursor/projection API yet |
+| CDC, Redis projection and reconciliation | Implemented; bounded stream, real Redis failure tests and exact same-watermark recovery |
 | Release tag / published distribution / deployment | Not performed by this milestone |
 
-Completion here establishes the bounded storage milestone under the documented
-filesystem assumptions. It does not establish the combined projection milestone
-or production suitability.
+Storage verification assumes the documented filesystem behavior. The projection
+additionally requires an exclusively owned standalone namespace and application
+reads through the adapter. These checks do not establish general production suitability.
 
 ## 2026-11-11 receipt
 
@@ -152,3 +152,34 @@ the workload, environment and measurement limits. Hosted verification is
 available in [Actions](https://github.com/imsayon/laminar-db/actions/workflows/ci.yml);
 match the full commit SHA and require gcc, clang, sanitizers, thread-sanitizer,
 formatting and static-analysis all successful.
+
+## Committed stream and Redis recovery
+
+The change-stream tests cover owned whole batches, limits and required_bytes,
+persistent exclusive cursors, order, >2^53/maximum sequences, concurrent pull,
+uncertain writes recovered only after sync, restart and compaction expiry.
+Projection tests require an isolated real Redis instance launched by the harness.
+They cover duplicate/gap handling, lost replies, timeout/outage, partial Lua errors,
+read admission, and SIGKILL before observing an error. Recovery tests cover exact
+same-watermark comparison, missing/wrong/extra/deleted data, checkpoint/dataset
+loss, partial rebuild, paused writes/reads and restart. The runnable projection
+demo is also a CTest gate. [Commands and measurement limits](projection.md) remain
+separate from physical power-loss evidence.
+
+## 2026-11-12 stream/projection local checks
+
+GCC 14 Debug, Clang/libc++ 18, ASan/UBSan and TSan passed all 13 CTest entries;
+GCC 14 Release passed all 14, including storage benchmark smoke. Final affected
+CDC/projection/demo checks passed again in all five builds after review, together
+with clang-tidy/format 18. The exact-byte-page regression verifies that a completed
+page does not inspect the following frame. An invalid later operation cannot
+publish an earlier valid operation. A real pre-mutation Lua ACL error exercises
+three bounded retries; a post-mutation error requires exact repair.
+
+Decoder checks passed 10,000 executions (seed 70506), a preliminary 100,000, and
+1,000,000 (seed 70507), with ASan/UBSan, max_len=16384 and timeout=5. These reuse
+the unchanged V1 codec target; full-size source caps remain deterministic tests.
+The isolated Redis 7.0.15 demonstration and three-repetition Release runner passed.
+Raw logs, machine/source metadata, latency samples and memory measurements stay
+under ignored build/. Match the final commit SHA against all six hosted Actions
+jobs before calling a pushed revision verified.

@@ -69,3 +69,11 @@ and metadata. There is no required speedup and no external-engine comparison.
 The [2026-11-11 evidence](results/2026-11-11.md) reports all cases, including clean
 compaction growth and serialized caller throughput. Measurements are local
 observations, not performance or hardware-durability guarantees.
+
+## Redis projection
+
+The fixed [projection demonstration](projection.cpp) and
+[three-repetition runner](projection_run.py) measure the single owning-process
+Redis slice. See [the projection guide](../docs/projection.md#reproduce-the-slice)
+for commands, workload, output fields, memory interpretation and failure tests.
+The source's full 16 MiB payload limit is exercised without splitting batches.
