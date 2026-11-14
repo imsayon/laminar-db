@@ -104,15 +104,22 @@ amplification, RAM-bound index, startup scan and offline maintenance are explici
 tradeoffs. The skip list/MemTable are separate learning components, not the
 persistent engine's write path.
 
-| Readiness item | Evidence/status |
+| V1 success criterion | Evidence/status |
 |---|---|
-| Binary CRUD, owned batches, restart, Inspect, Compact | Implemented; API/CLI/fixture/fault tests above |
-| Compiler, sanitizer, static and format gates | Dated run receipt below |
-| Seeded failures/shared keys and decoder fuzzing | Dated budgets and receipt below |
-| Reproducible performance/space observations | [Benchmark report](../bench/results/2026-11-11.md) |
+| Reference-map parity after restart, overwrite, delete and compaction | SATISFIED; seeded model, API and compaction tests |
+| Interrupted batches recover wholly or not at all | SATISFIED; every-byte cuts, injected failures and named process-kill boundaries |
+| Append/sync/replacement failures have explicit outcomes | SATISFIED; fault tests and [storage failure contract](storage.md#operations-and-failures) |
+| Bounded parsing of malformed/truncated/corrupt input | SATISFIED; fixtures, exact-cap tests and dated decoder fuzz budgets below |
+| Shared callers observe a serialized history | SATISFIED; small legal-history checks, publication barriers, shared-key stress and TSan |
+| Runnable persistence/batch/error/compaction demonstration | SATISFIED; CLI tests and [storage demo](../examples/storage_demo.sh) |
+| Reproducible measurements with raw output/environment | SATISFIED; [storage report](../bench/results/2026-11-11.md) and [projection runner](projection.md#reproduce-the-slice) |
+| Ordered committed batches and duplicate-safe projection progress | SATISFIED; [change-stream](../tests/test_changes.cpp) and [Redis apply](../tests/test_projection.cpp) tests |
+| History expiry/checkpoint loss require exact same-watermark repair | SATISFIED; [recovery tests](../tests/test_projection_recovery.cpp) and isolated projection demo |
+| Compiler, sanitizer, static and format gates | PASS; dated receipts below, with exact-SHA hosted verification |
 | Physical power loss / hardware certification | UNKNOWN; no experiment performed |
 | Network filesystem / hostile directory mutation | Unsupported operating model |
-| CDC, Redis projection and reconciliation | Implemented; bounded stream, real Redis failure tests and exact same-watermark recovery |
+| Scans/snapshots, background maintenance, arbitrary Redis writers/raw-reader admission | Unsupported V1 scope |
+| Production-workload suitability / owner acceptance for a deployment | UNKNOWN; no production evaluation or deployment acceptance observed |
 | Release tag / published distribution / deployment | Not performed by this milestone |
 
 Storage verification assumes the documented filesystem behavior. The projection
@@ -183,3 +190,48 @@ The isolated Redis 7.0.15 demonstration and three-repetition Release runner pass
 Raw logs, machine/source metadata, latency samples and memory measurements stay
 under ignored build/. Match the final commit SHA against all six hosted Actions
 jobs before calling a pushed revision verified.
+
+## 2026-11-14 technical closeout
+
+The bounded V1 implementation is technically ready for demonstration under the
+[storage](storage.md) and [projection](projection.md) assumptions. This is a
+development closeout, not a release or production acceptance. The implementation
+revision is `5f433591c6e64dc0610f03c80402e944b9577073`;
+[its push workflow](https://github.com/imsayon/laminar-db/actions/runs/43242173804)
+was independently checked: gcc, clang, sanitizers, thread-sanitizer, formatting
+and static-analysis all completed successfully on that exact SHA.
+
+Fresh checks used a clean Release build with Ubuntu 24.04, GCC 14.2.0, CMake
+3.28.3 and Redis 7.0.15 on Linux x86-64. The six focused CTest entries for changes,
+projection apply/recovery, CLI and both demos passed. Both demos also ran directly,
+and the README C++ example compiled and ran with a fresh synthetic DB path.
+The projection runner passed three fresh repetitions with `dirty=false`, all 42
+recorded source/tool hashes matching that commit, exact final convergence and
+zero sequence/byte lag. Successful test/demo fixtures and Redis processes were
+removed; logs and raw CSV/metadata remain under ignored `build/closeout-2026-11-14/`.
+
+```sh
+cmake --preset release -B build/closeout-2026-11-14/release -DCMAKE_CXX_COMPILER=g++-14
+cmake --build build/closeout-2026-11-14/release -j4
+ctest --test-dir build/closeout-2026-11-14/release -R 'changes|projection|cli|demo' --output-on-failure
+bash examples/storage_demo.sh build/closeout-2026-11-14/release/src/laminar
+build/closeout-2026-11-14/release/bench/laminar_projection_demo
+python3 bench/projection_run.py build/closeout-2026-11-14/release/bench/laminar_projection_demo build/closeout-2026-11-14/projection-evidence
+```
+
+Use a new runner output directory when repeating. The November 12 full compiler,
+sanitizer, static-analysis and decoder campaigns above are inherited evidence;
+the validated source/tool bytes are unchanged. They were not repeated as fresh
+local campaigns for this documentation closeout. The 24,000-operation model and
+16,384-commit shared-key campaigns originate at `be98940` and remain in the final
+regression suites. The million-execution decoder run used seed 70507 and generated
+inputs up to 16 KiB; it does not exhaust the full record-size range.
+
+Maximum legal batch Apply took **56.86–60.13 ms** in the three fresh repetitions,
+versus **60.64–63.36 ms** in the separate November 12 run on the same source SHA.
+These are workstation observations for two Puts plus 1,022 empty-key Deletes at
+the source caps, not a latency bound or speedup claim. The RAM index, log-scan
+startup, whole-record reads, serialized operations, offline compaction, paused-write
+rebuild, exclusively owned Redis namespace and adapter-only read admission remain
+explicit limits. Physical power loss and production-workload suitability remain
+UNKNOWN.
